@@ -1,0 +1,14 @@
+python-dotenv==1.0.1
+requests==2.32.3
+SpeechRecognition==3.10.4
+pyttsx3==2.91
+PyAudio==0.2.14
+psutil==6.0.0
+pyautogui==0.9.54
+pywhatkit==5.4
+edge-tts
+pygame
+flask
+duckduckgo-search
+pyperclip
+pillow

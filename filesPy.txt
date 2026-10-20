@@ -1,0 +1,2929 @@
+# ======================================================================
+# FILE: config.py
+# ======================================================================
+
+"""
+Ruta: config.py
+Descripción: Configuración central unificada de Argon 4 // Hermes Edition (Google Gemini, Ollama,
+Notion, IMAP, WhatsApp, Voz Grave y Telemetría JSON para Rainmeter/HUD).
+"""
+import json
+import logging
+import os
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+SKINS_DIR = BASE_DIR / "skins"
+SKINS_DIR.mkdir(exist_ok=True)
+
+TELEMETRY_FILE = LOG_DIR / "runtime_telemetry.json"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "agent_activity.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+
+class Config:
+    AGENT_NAME: str = os.getenv("AGENT_NAME", "Argon 4")
+    LANGUAGE_CODE: str = os.getenv("LANGUAGE_CODE", "es-PE")
+    ASSISTANT_VOICE: str = os.getenv("ASSISTANT_VOICE", "es-ES-AlvaroNeural")
+    VOICE_PITCH: str = os.getenv("VOICE_PITCH", "-14Hz")
+    VOICE_RATE_STR: str = os.getenv("VOICE_RATE", "+6%")
+    VOICE_RATE: int = 175
+    VOICE_VOLUME: float = float(os.getenv("VOICE_VOLUME", "1.0"))
+    REQUIRE_CONFIRMATION: bool = os.getenv("REQUIRE_CONFIRMATION", "false").lower() == "true"
+
+    # Motores Cognitivos (Google Gemini Principal + Ollama Local de Respaldo)
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
+    OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
+    OLLAMA_TIMEOUT: int = int(os.getenv("OLLAMA_TIMEOUT", "45"))
+
+    # Notion API
+    NOTION_API_KEY: str = os.getenv("NOTION_API_KEY", "").strip()
+    NOTION_DATABASE_ID: str = os.getenv("NOTION_DATABASE_ID", "").strip()
+
+    # Canales: Correo IMAP, WhatsApp y VoIP
+    EMAIL_IMAP_HOST: str = os.getenv("EMAIL_IMAP_HOST", "imap.gmail.com")
+    EMAIL_USER: str = os.getenv("EMAIL_USER", "framenhig@gmail.com").strip()
+    EMAIL_APP_PASSWORD: str = os.getenv("EMAIL_APP_PASSWORD", "").strip()
+
+    _raw_cc = os.getenv("DEFAULT_COUNTRY_CODE", "+51").strip().split()[0]
+    DEFAULT_COUNTRY_CODE: str = _raw_cc if _raw_cc.startswith("+") else "+51"
+    DEFAULT_TARGET_PHONE: str = os.getenv("DEFAULT_TARGET_PHONE", "+51978552756").strip()
+
+    WHATSAPP_BRIDGE_URL: str = os.getenv("WHATSAPP_BRIDGE_URL", "http://127.0.0.1:3000")
+    WHATSAPP_SESSION: str = os.getenv("WHATSAPP_SESSION", "argon_session")
+    SIP_SOFTPHONE_BIN: str = os.getenv("SIP_SOFTPHONE_BIN", "linphonecsh")
+
+    HUD_PORT: int = int(os.getenv("HUD_PORT", "8765"))
+
+
+_telemetry_lock = threading.Lock()
+_last_telemetry_signature = ""
+
+
+def write_telemetry_snapshot(state: str, active_tool: str, last_action: str) -> None:
+    """Guarda el estado instantáneo del agente en disco solo cuando cambia."""
+    global _last_telemetry_signature
+    clean_action = last_action[:150]
+    sig = f"{state}|{active_tool}|{clean_action}"
+
+    with _telemetry_lock:
+        if sig == _last_telemetry_signature:
+            return
+        _last_telemetry_signature = sig
+        payload: Dict[str, Any] = {
+            "status": state,
+            "tool": active_tool,
+            "last_action": clean_action,
+            "updated_at": datetime.now().strftime("%H:%M:%S"),
+        }
+        try:
+            TELEMETRY_FILE.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+
+# ======================================================================
+# FILE: main_agent.py
+# ======================================================================
+
+"""
+Ruta: main_agent.py
+Descripción: Orquestador Definitivo Argon 4 // Hermes Edition v4.0.
+Integra: HUD Holográfico 60 FPS, Endpoint Rainmeter (/telemetry), Voz Neuronal Grave (-14Hz),
+Memoria Persistente SQLite, Cerebro Híbrido (Google Gemini + Ollama Local),
+Sincronización con Notion API, WhatsApp y Acceso Directo en Windows 11.
+"""
+import logging
+import os
+import re
+import subprocess
+import threading
+import time
+import webbrowser
+from typing import Dict, Any, List
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from flask import Flask, request, jsonify, Response
+
+from config import Config, write_telemetry_snapshot
+from modules.voice_engine import VoiceEngine
+from modules.system_tasks import SystemTasks
+from modules.whatsapp_bridge import WhatsAppBridge
+from modules.voip_caller import VoIPCaller
+from modules.productivity_tools import ProductivityTools
+from modules.advanced_skills import AdvancedSkills
+from modules.notion_bridge import NotionBridge
+from modules.tool_router import AgentToolRouter
+from modules.hud_template import HUD_HTML
+
+
+class PollingLogFilter(logging.Filter):
+    """Oculta únicamente el polling de alta frecuencia de Rainmeter y el HUD."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "GET /telemetry" not in msg and "GET /api/state" not in msg
+
+
+logger = logging.getLogger("MainAgent")
+werkzeug_logger = logging.getLogger("werkzeug")
+werkzeug_logger.addFilter(PollingLogFilter())
+
+
+class ArgonHermesOrchestrator:
+    def __init__(self) -> None:
+        self.state = "IDLE"
+        self.active_tool = "NONE"
+        self.last_action = "Núcleo Argon 4 // Hermes inicializado con Google Gemini."
+        self.handsfree = False
+        self.ui_logs: List[Dict[str, str]] = []
+        self._state_lock = threading.RLock()
+
+        # Pool de conexiones HTTP persistentes para baja latencia
+        self.http = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=Retry(total=2, backoff_factor=0.2)
+        )
+        self.http.mount("http://", adapter)
+        self.http.mount("https://", adapter)
+
+        self.voice = VoiceEngine(on_state_change=self._on_state_change)
+        self.tasks = SystemTasks()
+        self.whatsapp = WhatsAppBridge()
+        self.voip = VoIPCaller()
+        self.productivity = ProductivityTools()
+        self.skills = AdvancedSkills()
+        self.notion = NotionBridge()
+
+        # Exportar skin de Rainmeter automáticamente al iniciar
+        self.notion.export_rainmeter_skin()
+
+        self.active_model: str = Config.OLLAMA_MODEL
+        self.gemini_online: bool = bool(Config.GEMINI_API_KEY)
+        self.ollama_online: bool = self._detect_ollama()
+
+        self.system_prompt = (
+            f"Eres {Config.AGENT_NAME} (Edición Hermes), un sistema agéntico multimodal avanzado estilo J.A.R.V.I.S. "
+            "impulsado por Google Gemini y ejecutándose en Windows 11 junto a Franco. Tu voz es grave, serena y futurista. "
+            "Cuentas con memoria persistente SQLite, agenda sincronizada con Notion, triaje de correo y WhatsApp. "
+            "Responde siempre en español con precisión ejecutiva en 1 a 3 oraciones claras."
+        )
+        self.chat_history: List[Dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+        past_turns = self.skills.load_recent_conversation(limit=8)
+        if past_turns:
+            self.chat_history.extend(past_turns)
+
+        self.router = AgentToolRouter(self)
+        write_telemetry_snapshot(self.state, self.active_tool, self.last_action)
+
+    def _on_state_change(self, new_state: str) -> None:
+        with self._state_lock:
+            self.state = new_state
+            write_telemetry_snapshot(self.state, self.active_tool, self.last_action)
+
+    def _set_tool_telemetry(self, tool_name: str, description: str) -> None:
+        with self._state_lock:
+            self.active_tool = tool_name
+            self.last_action = description
+            self.state = "TOOL_EXEC" if tool_name != "NONE" else "IDLE"
+            write_telemetry_snapshot(self.state, self.active_tool, self.last_action)
+
+    def _detect_ollama(self) -> bool:
+        try:
+            resp = self.http.get(f"{Config.OLLAMA_HOST}/api/tags", timeout=3)
+            if resp.status_code == 200:
+                models = [m.get("name") for m in resp.json().get("models", []) if m.get("name")]
+                if models:
+                    self.active_model = Config.OLLAMA_MODEL if Config.OLLAMA_MODEL in models else models[0]
+                    return True
+        except requests.RequestException:
+            pass
+        return False
+
+    def add_log(self, sender: str, text: str, tag: str = "agent") -> None:
+        with self._state_lock:
+            self.ui_logs.append({"sender": sender, "text": text, "tag": tag})
+            if len(self.ui_logs) > 60:
+                self.ui_logs = self.ui_logs[-60:]
+
+    def respond(self, text: str) -> None:
+        with self._state_lock:
+            self.last_action = text
+            self.active_tool = "VOICE_SYNTH"
+            write_telemetry_snapshot("SPEAKING", self.active_tool, self.last_action)
+        self.add_log(Config.AGENT_NAME.upper(), text, "agent")
+        self.skills.log_conversation_turn("assistant", text)
+        self.voice.speak(text)
+        with self._state_lock:
+            self.active_tool = "NONE"
+            self.state = "IDLE"
+            write_telemetry_snapshot("IDLE", self.active_tool, self.last_action)
+
+    def ask_brain(self, user_prompt: str, extra_context: str = "") -> str:
+        """Consulta a Google Gemini como motor principal y usa Ollama como respaldo local."""
+        memories = self.skills.recall_memories(limit=10)
+        mem_block = ""
+        if memories:
+            facts = "; ".join([f"[{m['category']}] {m['note']}" for m in memories])
+            mem_block = f"\n[MEMORIA PERMANENTE SOBRE FRANCO: {facts}]"
+
+        full_user_msg = f"{user_prompt}{mem_block}"
+        if extra_context:
+            full_user_msg += f"\n{extra_context}"
+
+        with self._state_lock:
+            self.chat_history.append({"role": "user", "content": full_user_msg})
+            if len(self.chat_history) > 15:
+                self.chat_history = [self.chat_history[0]] + self.chat_history[-14:]
+            history_snapshot = list(self.chat_history)
+
+        # 1. Motor Principal: Google Gemini API
+        if self.gemini_online:
+            try:
+                self._set_tool_telemetry("GOOGLE_GEMINI", f"Razonando con {Config.GEMINI_MODEL}...")
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{Config.GEMINI_MODEL}:generateContent?key={Config.GEMINI_API_KEY}"
+                )
+                gemini_contents = []
+                for m in history_snapshot:
+                    role = m.get("role")
+                    if role == "user":
+                        gemini_contents.append({"role": "user", "parts": [{"text": m["content"]}]})
+                    elif role == "assistant":
+                        gemini_contents.append({"role": "model", "parts": [{"text": m["content"]}]})
+
+                payload = {
+                    "systemInstruction": {"parts": [{"text": self.system_prompt}]},
+                    "contents": gemini_contents,
+                    "generationConfig": {
+                        "temperature": 0.4,
+                        "maxOutputTokens": 450,
+                    },
+                }
+                resp = self.http.post(url, json=payload, timeout=25)
+                if resp.status_code == 200:
+                    candidates = resp.json().get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        reply = "".join(p.get("text", "") for p in parts if "text" in p).strip()
+                        if reply:
+                            with self._state_lock:
+                                self.chat_history.append({"role": "assistant", "content": reply})
+                            return reply
+                else:
+                    logger.warning(f"Gemini API HTTP {resp.status_code}: {resp.text[:160]}")
+            except Exception as exc:
+                logger.warning(f"Fallo en Google Gemini, conmutando a Ollama local: {exc}")
+            finally:
+                with self._state_lock:
+                    self.state = "IDLE"
+
+        # 2. Motor de Respaldo Offline: Ollama Local
+        if not self.ollama_online:
+            self.ollama_online = self._detect_ollama()
+            if not self.ollama_online:
+                return "Configura tu GEMINI_API_KEY en el archivo .env o inicia el servidor local Ollama."
+
+        try:
+            self._set_tool_telemetry("OLLAMA_LLM", f"Inferencia en {self.active_model}...")
+            payload = {
+                "model": self.active_model,
+                "messages": history_snapshot,
+                "stream": False
+            }
+            resp = self.http.post(
+                f"{Config.OLLAMA_HOST}/api/chat",
+                json=payload,
+                timeout=Config.OLLAMA_TIMEOUT
+            )
+            if resp.status_code == 200:
+                reply = resp.json().get("message", {}).get("content", "").strip()
+                if reply:
+                    with self._state_lock:
+                        self.chat_history.append({"role": "assistant", "content": reply})
+                    return reply
+        except Exception as exc:
+            logger.error(f"Error consultando Ollama: {exc}")
+        finally:
+            with self._state_lock:
+                self.state = "IDLE"
+        return "Tuve una breve latencia en el motor neuronal. ¿Me lo repites?"
+
+    def get_unified_calendar(self) -> List[Dict[str, Any]]:
+        """Combina los pendientes locales con las tareas de Notion API si están activas."""
+        local_events = self.productivity.list_calendar_events()
+        notion_events = self.notion.fetch_tasks(limit=4)
+        return notion_events + local_events
+
+    def process_command(self, user_text: str) -> None:
+        text = user_text.lower().strip()
+        self.skills.log_conversation_turn("user", user_text)
+        self.skills.auto_extract_memory(user_text)
+
+        # Si el usuario encadena acciones múltiples ("y", "luego", "además"), usar el ToolRouter paralelo
+        if any(conn in text for conn in [" y ", " luego ", " además ", " ademas "]):
+            routed_compound = self.router.route_and_execute(user_text)
+            if routed_compound:
+                self.respond(routed_compound)
+                return
+
+        # 1. MEMORIA PERSISTENTE
+        if any(k in text for k in ["recuerda que", "memoriza que", "guarda en tu memoria", "no olvides que"]):
+            self._set_tool_telemetry("SQLITE_MEMORY", "Guardando recuerdo permanente")
+            cleaned = re.sub(
+                r"^(recuerda que|memoriza que|guarda en tu memoria|no olvides que)\s*:?\s*",
+                "",
+                user_text,
+                flags=re.IGNORECASE
+            ).strip()
+            res = self.skills.save_memory(cleaned, category="Clave")
+            self.respond(f"Registrado en mi núcleo de memoria permanente: {cleaned}." if res["ok"] else res["error"])
+            return
+
+        if any(k in text for k in ["qué recuerdas", "que recuerdas", "qué sabes de mí", "que sabes de mi"]):
+            self._set_tool_telemetry("SQLITE_MEMORY", "Consultando recuerdos permanentes")
+            mems = self.skills.recall_memories(limit=6)
+            if not mems:
+                self.respond("Aún estamos construyendo mi base de recuerdos permanentes contigo.")
+            else:
+                notes = ". ".join([m["note"] for m in mems])
+                self.respond(f"Tengo presente en mi memoria permanente lo siguiente: {notes}.")
+            return
+
+        # 2. ACCESO DIRECTO Y AUTO-ARRANQUE WINDOWS 11
+        if any(k in text for k in ["acceso directo", "arrancar con windows", "inicio automático", "inicio automatico"]):
+            self._set_tool_telemetry("WIN11_DEPLOY", "Configurando acceso directo / inicio")
+            enable_boot = "arrancar" in text or "inicio" in text
+            res = self.skills.setup_windows_integration(enable_startup=enable_boot)
+            self.respond(res["message"] if res["ok"] else res["error"])
+            return
+
+        # 3. INTELIGENCIA DE PORTAPAPELES
+        if any(k in text for k in ["portapapeles", "lo que copié", "lo que copie"]):
+            self._set_tool_telemetry("CLIPBOARD_AI", "Leyendo portapapeles del sistema")
+            res = self.skills.read_clipboard()
+            if not res["ok"]:
+                self.respond(res["error"])
+                return
+            self.respond("Inspeccionando el contenido de tu portapapeles.")
+            reply = self.ask_brain(
+                "Analiza lo que el usuario tiene en su portapapeles y dale una respuesta directa y útil:",
+                extra_context=f"[PORTAPAPELES]:\n{res['content']}"
+            )
+            self.respond(reply)
+            return
+
+        # 4. BÚSQUEDA WEB EN TIEMPO REAL
+        if any(k in text for k in ["busca en internet", "buscar en internet", "noticias de", "investiga sobre"]):
+            self._set_tool_telemetry("WEB_SEARCH", "Consultando resultados web en vivo")
+            query = re.sub(
+                r"^(busca en internet|buscar en internet|investiga sobre)\s*:?\s*",
+                "",
+                user_text,
+                flags=re.IGNORECASE
+            ).strip() or user_text
+            self.respond(f"Rastreando la red en tiempo real sobre {query}.")
+            web_res = self.skills.search_web(query)
+            if web_res["ok"]:
+                reply = self.ask_brain(
+                    f"Sintetiza en 2 frases estos resultados web actuales sobre '{query}':",
+                    extra_context=web_res["context"]
+                )
+                self.respond(reply)
+            else:
+                self.respond(web_res["error"])
+            return
+
+        # 5. TELEMETRÍA Y TOP PROCESOS
+        if any(k in text for k in ["qué procesos", "que procesos", "consumiendo más ram", "consumiendo mas ram"]):
+            self._set_tool_telemetry("PSUTIL_PROC", "Escaneando procesos en RAM")
+            res = self.skills.get_top_processes()
+            self.respond(f"Los procesos más exigentes en memoria son: {res['summary']}." if res["ok"] else res["error"])
+            return
+
+        if any(k in text for k in ["estado del sistema", "telemetría", "telemetria"]):
+            self._set_tool_telemetry("SYSTEM_STATUS", "Recolectando biometría de hardware")
+            res = self.tasks.get_system_status()
+            if res["ok"]:
+                d = res["data"]
+                self.respond(
+                    f"Todos los sistemas estables. CPU al {d['cpu_percent']}%, RAM al {d['ram_percent']}% "
+                    f"con {d['ram_available_gb']} gigabytes libres y batería al {d['battery_percent']}%."
+                )
+            return
+
+        # 6. AGENDA HÍBRIDA (LOCAL + NOTION API)
+        if any(k in text for k in ["agendar", "agregar pendiente", "nuevo pendiente", "anota en notion"]):
+            self._set_tool_telemetry("NOTION_CALENDAR", "Registrando evento en agenda y Notion")
+            cleaned = re.sub(
+                r"^(agendar|agregar pendiente|nuevo pendiente|anota en notion)\s*:?\s*",
+                "",
+                user_text,
+                flags=re.I
+            ).strip()
+            if cleaned:
+                self.productivity.add_calendar_event(cleaned)
+                notion_res = self.notion.create_task(cleaned)
+                if notion_res.get("ok"):
+                    self.respond(f"Evento sincronizado en tu agenda local y en tu base de datos de Notion: {cleaned}.")
+                else:
+                    self.respond(f"Agendado en tu panel táctico local: {cleaned}.")
+                return
+
+        if any(k in text for k in ["calendario", "pendientes", "qué tengo hoy", "que tengo hoy", "notion"]):
+            self._set_tool_telemetry("NOTION_CALENDAR", "Consultando agenda local y Notion")
+            evs = self.get_unified_calendar()
+            if not evs:
+                self.respond("No tienes pendientes activos en tu agenda ni en Notion.")
+            else:
+                titles = ", ".join([f"{e['id']}: {e['title']}" for e in evs[:4]])
+                self.respond(f"Tus pendientes activos son: {titles}.")
+            return
+
+        # 7. CORREOS Y AUDITORÍA DE CÓDIGO
+        if any(k in text for k in ["revisar correo", "revisar correos", "mis correos"]):
+            self._set_tool_telemetry("IMAP_MAIL", f"Consultando bandeja {Config.EMAIL_USER}")
+            res = self.productivity.check_emails()
+            self.respond(res["summary"] if res["ok"] else res["error"])
+            return
+
+        if any(k in text for k in ["revisar código", "revisar codigo", "analizar código", "analizar codigo"]):
+            self._set_tool_telemetry("AST_CODE_AUDIT", "Inspeccionando código fuente")
+            file_match = re.search(r"([a-zA-Z0-9_./\\-]+\.(?:py|js|ts|json|txt|md))", user_text)
+            target_file = file_match.group(1) if file_match else "main_agent.py"
+            res = self.productivity.analyze_code_file(target_file)
+            if not res["ok"]:
+                self.respond(res["error"])
+                return
+            reply = self.ask_brain(
+                f"Evalúa técnicamente este código ({res['filepath']}, {res['syntax']}):",
+                extra_context=res["snippet"]
+            )
+            self.respond(reply)
+            return
+
+        # 8. APLICACIONES, WHATSAPP Y VOIP
+        for app_name in ["calculadora", "bloc de notas", "explorador", "terminal"]:
+            if f"abrir {app_name}" in text or f"abre la {app_name}" in text:
+                self._set_tool_telemetry("OS_SUBPROCESS", f"Abriendo {app_name}")
+                res = self.tasks.open_application(app_name)
+                self.respond(f"Desplegando {app_name}." if res["ok"] else res["error"])
+                return
+
+        if "whatsapp" in text:
+            self._set_tool_telemetry("WHATSAPP_BRIDGE", "Despachando mensaje de WhatsApp")
+            match = re.search(r"(\+?\d[\d\s\-]{7,}\d).*?(?:diciendo|mensaje|que diga)\s+(.+)", user_text, re.I)
+            if match:
+                phone, msg = match.group(1).strip(), match.group(2).strip()
+            else:
+                msg_match = re.search(r"(?:diciendo|mensaje|que diga)\s+(.+)", user_text, re.I)
+                phone = Config.DEFAULT_TARGET_PHONE
+                msg = msg_match.group(1).strip() if msg_match else ""
+
+            if phone and msg:
+                self.respond(f"Transmitiendo WhatsApp a {phone}.")
+                res = self.whatsapp.send_message(phone, msg)
+                self.respond("Mensaje de WhatsApp entregado." if res["ok"] else res["error"])
+            else:
+                self.respond("Dime qué mensaje deseas enviar por WhatsApp, por ejemplo: 'Enviar WhatsApp diciendo Hola'.")
+            return
+
+        if "sala de voz" in text or "webrtc" in text:
+            self._set_tool_telemetry("VOIP_WEBRTC", "Creando sala WebRTC")
+            res = self.voip.start_webrtc_room()
+            if res["ok"]:
+                self.respond("Canal de voz WebRTC abierto.")
+            return
+
+        # 9. CONVERSACIÓN PROFUNDA CON MEMORIA PERSISTENTE
+        routed_reply = self.router.route_and_execute(user_text)
+        if routed_reply is not None:
+            self.respond(routed_reply)
+            return
+
+        reply = self.ask_brain(user_text)
+        self.respond(reply)
+
+
+# ---------------- SERVIDOR UNIFICADO (HUD 4K + RAINMETER TELEMETRY) ----------------
+app = Flask(__name__)
+core = ArgonHermesOrchestrator()
+
+
+@app.route("/")
+@app.route("/hud")
+def index() -> Response:
+    return Response(HUD_HTML, mimetype="text/html")
+
+
+@app.route("/telemetry")
+def rainmeter_telemetry() -> Response:
+    """Endpoint ligero JSON consumido por Rainmeter (skins/HUD_Agent.ini)."""
+    st = core.tasks.get_system_status()
+    d = st["data"] if st["ok"] else {"cpu_percent": 0, "ram_percent": 0, "battery_percent": 100}
+    return jsonify({
+        "status": core.state,
+        "tool": core.active_tool,
+        "last_action": core.last_action,
+        "updated_at": time.strftime("%H:%M:%S"),
+        "cpu": d["cpu_percent"],
+        "ram": d["ram_percent"],
+        "battery": d["battery_percent"],
+    })
+
+
+@app.route("/api/state")
+def api_state() -> Response:
+    st = core.tasks.get_system_status()
+    telemetry = st["data"] if st["ok"] else {"cpu_percent": 0, "ram_percent": 0, "battery_percent": 100}
+    return jsonify({
+        "state": core.state,
+        "active_tool": core.active_tool,
+        "last_action": core.last_action,
+        "model": f"GEMINI ({Config.GEMINI_MODEL})" if core.gemini_online else core.active_model,
+        "notion_enabled": core.notion.enabled,
+        "telemetry": telemetry,
+        "memories": core.skills.recall_memories(limit=8),
+        "calendar": core.get_unified_calendar(),
+        "logs": core.ui_logs,
+    })
+
+
+@app.route("/api/command", methods=["POST"])
+@app.route("/command", methods=["POST"])
+def api_command() -> Response:
+    data = request.get_json(force=True) or {}
+    text = (data.get("text") or data.get("prompt") or "").strip()
+    if text:
+        core.add_log("FRANCO", text, "user")
+        threading.Thread(target=core.process_command, args=(text,), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/listen", methods=["POST"])
+def api_listen() -> Response:
+    def _worker():
+        spoken = core.voice.listen()
+        if spoken:
+            core.add_log("FRANCO (VOZ)", spoken, "user")
+            core.process_command(spoken)
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/stop_voice", methods=["POST"])
+def api_stop_voice() -> Response:
+    core.voice.stop_speaking()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/handsfree", methods=["POST"])
+def api_handsfree() -> Response:
+    core.handsfree = not core.handsfree
+    if core.handsfree:
+        def _loop():
+            while core.handsfree:
+                if core.state == "IDLE":
+                    spoken = core.voice.listen(timeout=4, phrase_time_limit=14)
+                    if spoken:
+                        core.add_log("FRANCO (VOZ)", spoken, "user")
+                        if spoken.lower() in ["detener escucha", "modo manual"]:
+                            core.handsfree = False
+                            break
+                        core.process_command(spoken)
+                time.sleep(0.2)
+        threading.Thread(target=_loop, daemon=True).start()
+    return jsonify({"handsfree": core.handsfree})
+
+
+@app.route("/api/voice", methods=["POST"])
+def api_voice() -> Response:
+    data = request.get_json(force=True) or {}
+    voice = data.get("voice", "es-ES-AlvaroNeural")
+    pitch = data.get("pitch", "-14Hz")
+    rate = data.get("rate", "+6%")
+    core.voice.set_voice_profile(voice, pitch, rate)
+    threading.Thread(
+        target=lambda: core.respond("Frecuencia vocal recalibrada. Tono grave futurista activo."),
+        daemon=True
+    ).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/shortcut", methods=["POST"])
+def api_shortcut() -> Response:
+    data = request.get_json(force=True) or {}
+    startup = bool(data.get("startup", False))
+    res = core.skills.setup_windows_integration(enable_startup=startup)
+    return jsonify(res)
+
+
+def launch_hud_window(url: str) -> None:
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for path in edge_paths:
+        if os.path.exists(path):
+            subprocess.Popen([path, f"--app={url}", "--window-size=1440,870"])
+            return
+    webbrowser.open(url)
+
+
+if __name__ == "__main__":
+    PORT = Config.HUD_PORT
+    url = f"http://127.0.0.1:{PORT}"
+
+    desktop_lnk = os.path.join(os.path.expanduser("~"), "Desktop", "Argon 4 AI.lnk")
+    if not os.path.exists(desktop_lnk):
+        core.skills.setup_windows_integration(enable_startup=False)
+
+    def _BootSequence():
+        time.sleep(1.2)
+        launch_hud_window(url)
+        time.sleep(1.0)
+        mems = core.skills.recall_memories(limit=3)
+        if mems:
+            core.respond(
+                f"Arquitectura de {Config.AGENT_NAME} conectada a Google Gemini, Franco. "
+                f"He cargado {len(mems)} recuerdos permanentes y el puente de telemetría está activo."
+            )
+        else:
+            core.respond(
+                f"Núcleo {Config.AGENT_NAME} edición Hermes conectado a Google Gemini. Voz grave y telemetría activas."
+            )
+
+    threading.Thread(target=_BootSequence, daemon=True).start()
+    app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
+
+
+# ======================================================================
+# FILE: mcp_server.py
+# ======================================================================
+
+"""
+Ruta: mcp_server.py
+Descripción: Servidor Model Context Protocol (MCP) de Argon 4 // Hermes Edition.
+Expone la memoria SQLite, Notion, Agenda Local, Telemetría y WhatsApp a clientes MCP (VS Code / Antigravity).
+"""
+from typing import Any, Callable, Dict, List
+
+try:
+    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+except ImportError:
+    class FastMCP:  # type: ignore[no-redef]
+        """Respaldo ligero para evitar errores de importación si 'mcp' no está instalado en .venv."""
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.tools: List[Callable[..., Any]] = []
+
+        def tool(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.tools.append(func)
+                return func
+            return decorator
+
+        def run(self) -> None:
+            print(f"[{self.name}] Instala el paquete oficial ejecutando: .venv\\Scripts\\pip install mcp")
+
+from config import Config
+from modules.advanced_skills import AdvancedSkills
+from modules.notion_bridge import NotionBridge
+from modules.productivity_tools import ProductivityTools
+from modules.system_tasks import SystemTasks
+from modules.whatsapp_bridge import WhatsAppBridge
+
+mcp = FastMCP("Argon4-Hermes-MCP")
+
+skills = AdvancedSkills()
+notion = NotionBridge()
+productivity = ProductivityTools()
+tasks = SystemTasks()
+whatsapp = WhatsAppBridge()
+
+
+@mcp.tool()
+def remember_fact(note: str, category: str = "Proyecto") -> Dict[str, Any]:
+    """Guarda un hecho o nota técnica en la memoria SQLite permanente de Argon 4."""
+    return skills.save_memory(note, category=category)
+
+
+@mcp.tool()
+def recall_facts(limit: int = 10) -> List[Dict[str, Any]]:
+    """Recupera los recuerdos almacenados en la memoria SQLite de Argon 4."""
+    return skills.recall_memories(limit=limit)
+
+
+@mcp.tool()
+def get_hardware_telemetry() -> Dict[str, Any]:
+    """Devuelve métricas en tiempo real de CPU, RAM, espacio en disco y batería."""
+    return tasks.get_system_status()
+
+
+@mcp.tool()
+def get_top_ram_processes(limit: int = 5) -> Dict[str, Any]:
+    """Lista los procesos de Windows 11 que consumen más memoria RAM."""
+    return skills.get_top_processes(limit=limit)
+
+
+@mcp.tool()
+def list_unified_tasks() -> List[Dict[str, Any]]:
+    """Obtiene la agenda combinada (Calendario Local JSON + Notion API)."""
+    return notion.fetch_tasks(limit=5) + productivity.list_calendar_events()
+
+
+@mcp.tool()
+def create_unified_task(title: str) -> Dict[str, Any]:
+    """Crea un pendiente simultáneamente en la agenda local y en Notion API."""
+    local_res = productivity.add_calendar_event(title)
+    notion_res = notion.create_task(title)
+    return {"local": local_res, "notion": notion_res}
+
+
+@mcp.tool()
+def audit_project_code(relative_path: str) -> Dict[str, Any]:
+    """Analiza el árbol AST y devuelve un fragmento seguro de un archivo del proyecto."""
+    return productivity.analyze_code_file(relative_path)
+
+
+@mcp.tool()
+def dispatch_whatsapp(message: str, phone: str = "") -> Dict[str, Any]:
+    """Envía un mensaje por el puente de WhatsApp de Argon 4."""
+    target = phone.strip() if phone else Config.DEFAULT_TARGET_PHONE
+    return whatsapp.send_message(target, message)
+
+
+if __name__ == "__main__":
+    mcp.run()
+
+
+# ======================================================================
+# FILE: modules\__init__.py
+# ======================================================================
+
+
+
+
+# ======================================================================
+# FILE: modules\advanced_skills.py
+# ======================================================================
+
+"""
+Ruta: modules/advanced_skills.py
+Descripción: Memoria Cognitiva Persistente (hechos + historial entre sesiones en SQLite),
+Auto-extracción de recuerdos, Búsqueda Web, Portapapeles y Despliegue en Escritorio/Inicio de Windows.
+"""
+import os
+import re
+import sqlite3
+import subprocess
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+import psutil
+import pyperclip
+from duckduckgo_search import DDGS
+from config import BASE_DIR, LOG_DIR
+
+logger = logging.getLogger("AdvancedSkills")
+MEMORY_DB = LOG_DIR / "argon_memory.db"
+
+
+class AdvancedSkills:
+    def __init__(self) -> None:
+        self._memories_cache: Optional[List[Dict[str, Any]]] = None
+        self._init_memory_db()
+
+    @staticmethod
+    def _get_conn() -> sqlite3.Connection:
+        return sqlite3.connect(MEMORY_DB, timeout=10.0)
+
+    @staticmethod
+    def _init_memory_db() -> None:
+        """Inicializa tablas para memoria semántica (hechos) y memoria episódica (conversación)."""
+        with AdvancedSkills._get_conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT DEFAULT 'General',
+                    note TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(memories);")]
+            if "category" not in cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN category TEXT DEFAULT 'General';")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    # ---------------- 1. MEMORIA PERSISTENTE Y AUTO-APRENDIZAJE ----------------
+    def save_memory(self, note: str, category: str = "Usuario") -> Dict[str, Any]:
+        clean = note.strip()
+        if not clean:
+            return {"ok": False, "error": "El contenido a recordar está vacío."}
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with self._get_conn() as conn:
+                # Evitar duplicados exactos
+                existing = conn.execute("SELECT id FROM memories WHERE lower(note) = ?", (clean.lower(),)).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO memories (category, note, created_at) VALUES (?, ?, ?)",
+                        (category, clean, now)
+                    )
+                    conn.commit()
+            self._memories_cache = None
+            logger.info(f"Memoria persistente almacenada [{category}]: {clean}")
+            return {"ok": True, "note": clean, "category": category}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def delete_memory(self, mem_id: int) -> Dict[str, Any]:
+        try:
+            with self._get_conn() as conn:
+                conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+                conn.commit()
+            self._memories_cache = None
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def recall_memories(self, limit: int = 10) -> List[Dict[str, Any]]:
+        try:
+            if self._memories_cache is not None:
+                return self._memories_cache[:limit]
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "SELECT id, category, note, created_at FROM memories ORDER BY id DESC"
+                )
+                rows = cur.fetchall()
+            self._memories_cache = [{"id": r[0], "category": r[1], "note": r[2], "date": r[3]} for r in rows]
+            return self._memories_cache[:limit]
+        except Exception as exc:
+            logger.error(f"Error leyendo memoria SQLite: {exc}")
+            return []
+
+    def auto_extract_memory(self, user_text: str) -> None:
+        """
+        Detecta automáticamente datos importantes que el usuario menciona en conversación natural
+        (gustos, proyectos, objetivos, datos personales) y los guarda sin que tenga que pedirlo.
+        """
+        patterns = [
+            (r"mi proyecto (?:se llama|es|trata sobre)\s+([^.,;\n]+)", "Proyecto"),
+            (r"estoy trabajando en\s+([^.,;\n]+)", "Proyecto"),
+            (r"prefiero\s+([^.,;\n]+)", "Preferencia"),
+            (r"me gusta\s+([^.,;\n]+)", "Preferencia"),
+            (r"mi correo (?:es|principal es)\s+([^.,;\n]+)", "Contacto"),
+            (r"mi objetivo es\s+([^.,;\n]+)", "Objetivo"),
+            (r"tengo que entregar\s+([^.,;\n]+)", "Prioridad"),
+        ]
+        for pat, cat in patterns:
+            match = re.search(pat, user_text, re.IGNORECASE)
+            if match and len(match.group(0)) < 140:
+                self.save_memory(match.group(0).strip(), category=cat)
+                break
+
+    def log_conversation_turn(self, role: str, content: str) -> None:
+        """Guarda cada turno de conversación en disco para recordar entre sesiones."""
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with self._get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO chat_log (role, content, timestamp) VALUES (?, ?, ?)",
+                    (role, content.strip(), now)
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.error(f"Error guardando historial de chat: {exc}")
+
+    def load_recent_conversation(self, limit: int = 10) -> List[Dict[str, str]]:
+        """Recupera las últimas interacciones de sesiones anteriores al iniciar Argon 4."""
+        try:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "SELECT role, content FROM chat_log ORDER BY id DESC LIMIT ?",
+                    (limit,)
+                )
+                rows = cur.fetchall()
+            return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        except Exception:
+            return []
+
+    # ---------------- 2. ACCESO DIRECTO Y AUTO-ARRANQUE WINDOWS 11 ----------------
+    @staticmethod
+    def setup_windows_integration(enable_startup: bool = False) -> Dict[str, Any]:
+        """
+        Crea un lanzador silencioso (.vbs) + Acceso Directo en el Escritorio de Windows
+        y opcionalmente lo registra en el Inicio Automático de Windows (shell:startup).
+        """
+        try:
+            venv_pythonw = BASE_DIR / ".venv" / "Scripts" / "pythonw.exe"
+            venv_python = BASE_DIR / ".venv" / "Scripts" / "python.exe"
+            python_bin = venv_pythonw if venv_pythonw.exists() else venv_python
+
+            # 1. Crear script .bat y lanzador silencioso .vbs en la raíz del proyecto
+            bat_path = BASE_DIR / "Launch_Argon4.bat"
+            bat_content = (
+                f'@echo off\n'
+                f'cd /d "{BASE_DIR}"\n'
+                f'"{venv_python}" "{BASE_DIR / "main_agent.py"}"\n'
+            )
+            bat_path.write_text(bat_content, encoding="utf-8")
+
+            vbs_path = BASE_DIR / "Argon4_Silent_Launcher.vbs"
+            vbs_content = (
+                f'Set WshShell = CreateObject("WScript.Shell")\n'
+                f'WshShell.CurrentDirectory = "{BASE_DIR}"\n'
+                f'WshShell.Run """{python_bin}"" ""{BASE_DIR / "main_agent.py"}""", 0, False\n'
+            )
+            vbs_path.write_text(vbs_content, encoding="utf-8")
+
+            # 2. Crear Acceso Directo (.lnk) en el Escritorio usando PowerShell nativo
+            desktop_dir = Path(os.path.expanduser("~")) / "Desktop"
+            shortcut_desktop = desktop_dir / "Argon 4 AI.lnk"
+
+            ps_script = (
+                f'$WshShell = New-Object -ComObject WScript.Shell; '
+                f'$Shortcut = $WshShell.CreateShortcut("{shortcut_desktop}"); '
+                f'$Shortcut.TargetPath = "wscript.exe"; '
+                f'$Shortcut.Arguments = """{vbs_path}"""; '
+                f'$Shortcut.WorkingDirectory = "{BASE_DIR}"; '
+                f'$Shortcut.IconLocation = "shell32.dll,13"; '
+                f'$Shortcut.Description = "Argon 4 Tactical AI Assistant"; '
+                f'$Shortcut.Save()'
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], check=True)
+
+            # 3. Configurar o quitar de Inicio Automático de Windows (Startup)
+            startup_dir = (
+                Path(os.environ.get("APPDATA", ""))
+                / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+            )
+            shortcut_startup = startup_dir / "Argon 4 AI.lnk"
+
+            startup_msg = "Acceso directo creado en tu Escritorio ('Argon 4 AI')."
+            if enable_startup and startup_dir.exists():
+                ps_startup = ps_script.replace(str(shortcut_desktop), str(shortcut_startup))
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps_startup], check=True)
+                startup_msg = "Acceso directo creado en el Escritorio y activado en el Inicio Automático de Windows."
+            elif not enable_startup and shortcut_startup.exists():
+                shortcut_startup.unlink()
+
+            return {"ok": True, "message": startup_msg}
+        except Exception as exc:
+            logger.error(f"Error configurando acceso directo en Windows: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    # ---------------- 3. BÚSQUEDA WEB, PORTAPAPELES Y PROCESOS ----------------
+    @staticmethod
+    def search_web(query: str, max_results: int = 3) -> Dict[str, Any]:
+        clean_q = query.strip()
+        if not clean_q:
+            return {"ok": False, "error": "Consulta vacía."}
+        try:
+            results = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(clean_q, region="pe-es", max_results=max_results):
+                    results.append(f"- {r.get('title', '')}: {r.get('body', '')}")
+            if not results:
+                return {"ok": False, "error": "Sin resultados web."}
+            return {"ok": True, "query": clean_q, "context": "\n".join(results)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def read_clipboard() -> Dict[str, Any]:
+        try:
+            content = pyperclip.paste()
+            if not content or not content.strip():
+                return {"ok": False, "error": "Portapapeles vacío."}
+            return {"ok": True, "content": content.strip()[:2500]}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def get_top_processes(limit: int = 4) -> Dict[str, Any]:
+        try:
+            procs = []
+            for p in psutil.process_iter(["pid", "name", "memory_info"]):
+                try:
+                    mem_mb = p.info["memory_info"].rss / (1024 * 1024)
+                    procs.append({"name": p.info["name"], "mem_mb": round(mem_mb, 1)})
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            procs.sort(key=lambda x: x["mem_mb"], reverse=True)
+            top = procs[:limit]
+            summary = ", ".join([f"{item['name']} ({item['mem_mb']} MB)" for item in top])
+            return {"ok": True, "top": top, "summary": summary}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+
+# ======================================================================
+# FILE: modules\hud_template.py
+# ======================================================================
+
+"""
+Ruta: modules/hud_template.py
+Descripción: Interfaz Holográfica 4K Argon 4 // Hermes Edition (Canvas 60 FPS, Telemetría de
+Herramientas en Vivo, Memoria Persistente SQLite, Agenda Híbrida Notion y Control de Voz Grave).
+"""
+
+HUD_HTML = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>ARGON 4 // HERMES TACTICAL OS v4.0</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-deep: #02060d;
+    --panel-glass: rgba(6, 20, 39, 0.76);
+    --cyan: #00f0ff;
+    --cyan-glow: rgba(0, 240, 255, 0.35);
+    --blue: #0077ff;
+    --amber: #ffbe0b;
+    --crimson: #ff0055;
+    --emerald: #00f5d4;
+    --text-main: #e2f9ff;
+    --text-dim: #6488a4;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+  body {
+    background: radial-gradient(circle at 50% 45%, #071930 0%, #02060d 75%);
+    color: var(--text-main);
+    font-family: 'Rajdhani', sans-serif;
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  body::before {
+    content: "";
+    position: absolute; inset: 0;
+    background-image: 
+      linear-gradient(rgba(0, 240, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 240, 255, 0.04) 1px, transparent 1px);
+    background-size: 36px 36px;
+    pointer-events: none;
+    z-index: 0;
+  }
+  header {
+    z-index: 2;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 24px;
+    margin: 12px 18px 4px;
+    background: var(--panel-glass);
+    border: 1px solid rgba(0, 240, 255, 0.35);
+    box-shadow: 0 0 25px rgba(0, 240, 255, 0.12), inset 0 0 15px rgba(0, 240, 255, 0.06);
+    clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+    backdrop-filter: blur(14px);
+  }
+  .brand {
+    display: flex; align-items: center; gap: 14px;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 1.2rem; font-weight: 900;
+    letter-spacing: 3px; color: var(--cyan);
+    text-shadow: 0 0 12px var(--cyan-glow);
+  }
+  .header-controls { display: flex; align-items: center; gap: 10px; }
+  select, .hud-btn {
+    background: rgba(3, 12, 26, 0.9);
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+    padding: 7px 12px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  }
+  .hud-btn:hover, select:hover {
+    background: var(--cyan); color: #02060d;
+    box-shadow: 0 0 16px var(--cyan);
+  }
+  .badge {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.82rem; padding: 6px 12px;
+    border: 1px solid var(--emerald); color: var(--emerald);
+    background: rgba(0, 245, 212, 0.08);
+  }
+  main {
+    z-index: 2;
+    flex: 1;
+    display: grid;
+    grid-template-columns: 360px 1fr 440px;
+    gap: 16px;
+    padding: 10px 18px 18px;
+    min-height: 0;
+  }
+  .panel {
+    background: var(--panel-glass);
+    border: 1px solid rgba(0, 240, 255, 0.28);
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.6), inset 0 0 20px rgba(0, 240, 255, 0.04);
+    backdrop-filter: blur(16px);
+    clip-path: polygon(0 0, calc(100% - 20px) 0, 100% 20px, 100% 100%, 20px 100%, 0 calc(100% - 20px));
+    padding: 16px;
+    display: flex; flex-direction: column; gap: 10px;
+    min-height: 0;
+  }
+  .panel-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 0.82rem; letter-spacing: 2px;
+    color: var(--cyan);
+    border-bottom: 1px solid rgba(0, 240, 255, 0.25);
+    padding-bottom: 5px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .gauges { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; padding: 4px 0; }
+  .gauge-card {
+    text-align: center; background: rgba(2, 8, 18, 0.6);
+    border: 1px solid rgba(0, 240, 255, 0.15); padding: 6px 4px;
+  }
+  .gauge-val {
+    font-family: 'Orbitron', sans-serif; font-size: 0.95rem;
+    color: var(--text-main);
+  }
+  .gauge-lbl { font-family: 'Share Tech Mono', monospace; font-size: 0.68rem; color: var(--text-dim); }
+  .scroll-list {
+    flex: 1; overflow-y: auto;
+    background: rgba(2, 8, 18, 0.65);
+    border: 1px solid rgba(0, 240, 255, 0.14);
+    padding: 10px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.83rem;
+    user-select: text;
+  }
+  .mem-item {
+    padding: 6px 8px; margin-bottom: 6px;
+    border-left: 2px solid var(--amber);
+    background: rgba(255, 190, 11, 0.06);
+  }
+  .cal-item {
+    padding: 6px 8px; margin-bottom: 6px;
+    border-left: 2px solid var(--emerald);
+    background: rgba(0, 245, 212, 0.06);
+  }
+  .quick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .center-stage {
+    position: relative;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+  }
+  #reactorCanvas {
+    cursor: pointer;
+    filter: drop-shadow(0 0 18px rgba(0, 240, 255, 0.25));
+  }
+  .state-banner {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 1.0rem; letter-spacing: 3px;
+    color: var(--cyan);
+    text-shadow: 0 0 10px var(--cyan);
+    margin-top: 4px;
+  }
+  .sub-banner {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.82rem; color: var(--amber);
+    margin-top: 4px;
+  }
+  .voice-controls { display: flex; gap: 12px; margin-top: 12px; }
+  .btn-primary {
+    background: rgba(0, 240, 255, 0.16);
+    border: 1px solid var(--cyan);
+    color: var(--text-main);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 0.82rem; letter-spacing: 1.5px;
+    padding: 10px 20px; cursor: pointer;
+    box-shadow: 0 0 18px rgba(0, 240, 255, 0.2);
+    clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+    transition: 0.2s;
+  }
+  .btn-primary:hover, .btn-primary.active {
+    background: var(--cyan); color: #02060d;
+    box-shadow: 0 0 28px var(--cyan);
+  }
+  #chatStream {
+    flex: 1; overflow-y: auto;
+    padding: 12px;
+    background: rgba(2, 8, 18, 0.72);
+    border: 1px solid rgba(0, 240, 255, 0.15);
+    display: flex; flex-direction: column; gap: 12px;
+    user-select: text;
+  }
+  .msg {
+    padding: 10px 14px;
+    line-height: 1.45;
+    font-size: 0.96rem;
+    clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+  }
+  .msg.agent {
+    border-left: 3px solid var(--cyan);
+    background: rgba(0, 240, 255, 0.08);
+    color: var(--text-main);
+  }
+  .msg.user {
+    border-right: 3px solid var(--amber);
+    background: rgba(255, 190, 11, 0.08);
+    color: #fff3cd;
+    align-self: flex-end;
+    max-width: 90%;
+  }
+  .msg-sender {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 0.68rem; letter-spacing: 1.5px;
+    margin-bottom: 4px; opacity: 0.8;
+  }
+  .input-row { display: flex; gap: 8px; }
+  #cmdInput {
+    flex: 1;
+    background: rgba(2, 10, 22, 0.95);
+    border: 1px solid var(--cyan);
+    color: var(--text-main);
+    padding: 12px 14px;
+    font-family: 'Rajdhani', sans-serif;
+    font-size: 1.02rem;
+    outline: none;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span>❖ ARGON 4 // HERMES</span>
+    <span style="font-size:0.72rem; color:var(--text-dim);">HYBRID COGNITIVE ARCHITECTURE v4.0</span>
+  </div>
+  <div class="header-controls">
+    <select id="voiceSelect" onchange="changeVoice()">
+      <option value="es-ES-AlvaroNeural|-14Hz|+6%">VOZ: J.A.R.V.I.S. PROFUNDO (ÁLVARO -14Hz)</option>
+      <option value="es-ES-AlvaroNeural|-18Hz|+4%">VOZ: J.A.R.V.I.S. ULTRA GRAVE (ÁLVARO -18Hz)</option>
+      <option value="es-MX-JorgeNeural|-14Hz|+6%">VOZ: TÁCTICO GRAVE (JORGE -14Hz)</option>
+      <option value="es-PE-AlexNeural|-12Hz|+6%">VOZ: EJECUTIVO GRAVE (ALEX -12Hz)</option>
+      <option value="es-PE-CamilaNeural|-4Hz|+8%">VOZ: F.R.I.D.A.Y. (CAMILA NEURAL)</option>
+    </select>
+    <button class="hud-btn" onclick="setupShortcut(false)">⚡ ACCESO DIRECTO</button>
+    <button class="hud-btn" onclick="setupShortcut(true)">🚀 AUTO-ARRANQUE</button>
+    <div id="ollamaBadge" class="badge">● MOTOR: ACTIVO</div>
+  </div>
+</header>
+
+<main>
+  <!-- COLUMNA IZQUIERDA -->
+  <section class="panel">
+    <div class="panel-title"><span>01 // TELEMETRÍA Y DISPATCHER</span><span>/telemetry</span></div>
+    <div class="gauges">
+      <div class="gauge-card">
+        <div id="cpuVal" class="gauge-val">--%</div>
+        <div class="gauge-lbl">CPU</div>
+      </div>
+      <div class="gauge-card">
+        <div id="ramVal" class="gauge-val">--%</div>
+        <div class="gauge-lbl">RAM</div>
+      </div>
+      <div class="gauge-card">
+        <div id="batVal" class="gauge-val">--%</div>
+        <div class="gauge-lbl">BAT</div>
+      </div>
+      <div class="gauge-card">
+        <div id="toolVal" class="gauge-val" style="color:var(--amber); font-size:0.78rem;">NONE</div>
+        <div class="gauge-lbl">TOOL</div>
+      </div>
+    </div>
+
+    <div class="panel-title">
+      <span>02 // MEMORIA COGNITIVA (SQLITE)</span>
+      <span style="font-size:0.68rem; color:var(--amber);">AUTO-LEARN</span>
+    </div>
+    <div id="memoryList" class="scroll-list"></div>
+    <div style="display:flex; gap:6px;">
+      <input id="memInput" type="text" placeholder="Guardar recuerdo permanente..." style="flex:1; background:#030b17; border:1px solid #1b4965; color:#fff; padding:6px 10px; font-family:'Rajdhani';">
+      <button class="hud-btn" onclick="addMemoryManual()">+ MEMORIA</button>
+    </div>
+
+    <div class="panel-title">
+      <span>03 // AGENDA LOCAL + NOTION API</span>
+      <span id="notionBadge" style="font-size:0.68rem; color:var(--emerald);">SYNC</span>
+    </div>
+    <div id="calendarList" class="scroll-list" style="max-height:105px;"></div>
+
+    <div class="quick-grid">
+      <button class="hud-btn" onclick="sendCmd('Analiza mi portapapeles')">📋 PORTAPAPELES</button>
+      <button class="hud-btn" onclick="sendCmd('Busca en internet noticias tecnológicas de hoy')">🌐 WEB EN VIVO</button>
+      <button class="hud-btn" onclick="sendCmd('Qué pendientes tengo hoy en mi agenda y Notion')">📅 AGENDA / NOTION</button>
+      <button class="hud-btn" onclick="sendCmd('Revisar correos')">📧 MIS CORREOS</button>
+    </div>
+  </section>
+
+  <!-- COLUMNA CENTRAL: REACTOR HOLOGRÁFICO -->
+  <section class="center-stage">
+    <canvas id="reactorCanvas" width="420" height="420" onclick="triggerVoiceListen()"></canvas>
+    <div id="stateBanner" class="state-banner">● NÚCLEO EN ESPERA (CLIC PARA HABLAR)</div>
+    <div id="lastActionBanner" class="sub-banner">TELEMETRÍA RAINMETER ACTIVA EN /telemetry</div>
+    <div class="voice-controls">
+      <button class="btn-primary" onclick="triggerVoiceListen()">🎙️ HABLAR AHORA</button>
+      <button class="btn-primary" onclick="stopVoice()">⏹️ SILENCIAR</button>
+      <button id="btnHandsfree" class="btn-primary" onclick="toggleHandsfree()">🔄 CONVERSACIÓN CONTINUA: OFF</button>
+    </div>
+  </section>
+
+  <!-- COLUMNA DERECHA: CONSOLA NEURONAL -->
+  <section class="panel">
+    <div class="panel-title">
+      <span>04 // ENLACE DE COMUNICACIÓN DIRECTA</span>
+      <span id="modelLabel" style="color:var(--emerald);">LLAMA3.1</span>
+    </div>
+    <div id="chatStream"></div>
+    <div class="input-row">
+      <input id="cmdInput" type="text" placeholder="Conversa o pide una acción (ej. 'Envíame un WhatsApp diciendo...', 'Agendar en Notion...')..." onkeydown="if(event.key==='Enter') sendFromInput()">
+      <button class="btn-primary" onclick="sendFromInput()">TRANSMITIR ➤</button>
+    </div>
+  </section>
+</main>
+
+<script>
+  let agentState = "IDLE";
+  let lastLogCount = 0;
+  let handsfreeActive = false;
+  let lastMemJson = "";
+  let lastCalJson = "";
+
+  function escapeHtml(str) {
+    if (str == null) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  const canvas = document.getElementById("reactorCanvas");
+  const ctx = canvas.getContext("2d");
+  let t = 0;
+
+  function drawReactor() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+
+    let mainColor = "#00f0ff";
+    let speed = 0.015;
+    if (agentState === "LISTENING") { mainColor = "#ffbe0b"; speed = 0.035; }
+    else if (agentState === "THINKING" || agentState === "TOOL_EXEC") { mainColor = "#ff0055"; speed = 0.055; }
+    else if (agentState === "SPEAKING") { mainColor = "#00f5d4"; speed = 0.04; }
+
+    t += speed;
+
+    ctx.save();
+    ctx.shadowBlur = 18;
+    ctx.shadowColor = mainColor;
+
+    ctx.strokeStyle = "rgba(0, 240, 255, 0.25)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 186, 0, Math.PI * 2);
+    ctx.stroke();
+
+    for (let i = 0; i < 60; i++) {
+      const ang = (i * 6 * Math.PI) / 180 + t * 0.2;
+      const r1 = i % 5 === 0 ? 174 : 180;
+      ctx.strokeStyle = i % 5 === 0 ? mainColor : "rgba(0,240,255,0.3)";
+      ctx.beginPath();
+      ctx.moveTo(cx + r1 * Math.cos(ang), cy + r1 * Math.sin(ang));
+      ctx.lineTo(cx + 186 * Math.cos(ang), cy + 186 * Math.sin(ang));
+      ctx.stroke();
+    }
+
+    ctx.strokeStyle = mainColor;
+    ctx.lineWidth = 5;
+    for (let i = 0; i < 4; i++) {
+      const start = t + (i * Math.PI) / 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 154, start, start + 0.9);
+      ctx.stroke();
+    }
+
+    ctx.strokeStyle = "#0077ff";
+    ctx.lineWidth = 3;
+    for (let i = 0; i < 3; i++) {
+      const start = -t * 1.4 + (i * Math.PI * 2) / 3;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 124, start, start + 1.3);
+      ctx.stroke();
+    }
+
+    const bars = 48;
+    for (let i = 0; i < bars; i++) {
+      const ang = (i * Math.PI * 2) / bars - t * 0.5;
+      let amp = 8 + Math.sin(t * 4 + i * 0.5) * 5;
+      if (agentState === "SPEAKING") {
+        amp = 12 + Math.abs(Math.sin(t * 10 + i * 1.1)) * 35;
+      } else if (agentState === "LISTENING") {
+        amp = 10 + Math.abs(Math.cos(t * 8 + i)) * 22;
+      }
+      const rStart = 76;
+      const rEnd = rStart + amp;
+      ctx.strokeStyle = mainColor;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(cx + rStart * Math.cos(ang), cy + rStart * Math.sin(ang));
+      ctx.lineTo(cx + rEnd * Math.cos(ang), cy + rEnd * Math.sin(ang));
+      ctx.stroke();
+    }
+
+    const pulse = agentState === "SPEAKING" ? Math.sin(t * 8) * 8 : Math.sin(t * 2) * 3;
+    const coreRadius = 54 + pulse;
+    const grad = ctx.createRadialGradient(cx, cy, 8, cx, cy, coreRadius);
+    grad.addColorStop(0, "rgba(0, 240, 255, 0.45)");
+    grad.addColorStop(1, "rgba(3, 12, 28, 0.92)");
+
+    ctx.fillStyle = grad;
+    ctx.strokeStyle = mainColor;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(cx, cy, coreRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = "#e2f9ff";
+    ctx.font = "900 15px 'Orbitron'";
+    ctx.textAlign = "center";
+    ctx.fillText("ARGON 4", cx, cy - 3);
+    ctx.fillStyle = mainColor;
+    ctx.font = "11px 'Share Tech Mono'";
+    ctx.fillText(agentState, cx, cy + 15);
+
+    ctx.restore();
+    requestAnimationFrame(drawReactor);
+  }
+  requestAnimationFrame(drawReactor);
+
+  async function pollState() {
+    try {
+      const res = await fetch("/api/state");
+      const data = await res.json();
+
+      agentState = data.state;
+      document.getElementById("stateBanner").innerText = "● ESTADO DEL NÚCLEO: " + data.state;
+      document.getElementById("lastActionBanner").innerText = "ACCIÓN: " + data.last_action;
+      document.getElementById("cpuVal").innerText = data.telemetry.cpu_percent + "%";
+      document.getElementById("ramVal").innerText = data.telemetry.ram_percent + "%";
+      document.getElementById("batVal").innerText = data.telemetry.battery_percent + "%";
+      document.getElementById("toolVal").innerText = data.active_tool;
+      document.getElementById("modelLabel").innerText = data.model;
+      document.getElementById("notionBadge").innerText = data.notion_enabled ? "NOTION ONLINE" : "LOCAL JSON";
+
+      const memJson = JSON.stringify(data.memories || []);
+      if (memJson !== lastMemJson) {
+        lastMemJson = memJson;
+        const memBox = document.getElementById("memoryList");
+        memBox.innerHTML = (!data.memories || data.memories.length === 0)
+          ? "<div style='color:var(--text-dim)'>Sin memorias registradas aún.</div>"
+          : data.memories.map(m => `<div class="mem-item"><strong>[${escapeHtml(m.category)}]</strong> ${escapeHtml(m.note)}</div>`).join("");
+      }
+
+      const calJson = JSON.stringify(data.calendar || []);
+      if (calJson !== lastCalJson) {
+        lastCalJson = calJson;
+        const calBox = document.getElementById("calendarList");
+        calBox.innerHTML = (!data.calendar || data.calendar.length === 0)
+          ? "<div style='color:var(--text-dim)'>Sin pendientes activos.</div>"
+          : data.calendar.map(c => `<div class="cal-item">#${c.id} - ${escapeHtml(c.title)}</div>`).join("");
+      }
+
+      if (data.logs.length !== lastLogCount) {
+        lastLogCount = data.logs.length;
+        const stream = document.getElementById("chatStream");
+        stream.innerHTML = data.logs.map(item => `
+          <div class="msg ${item.tag}">
+            <div class="msg-sender">${escapeHtml(item.sender)}</div>
+            <div>${escapeHtml(item.text)}</div>
+          </div>
+        `).join("");
+        stream.scrollTop = stream.scrollHeight;
+      }
+    } catch (e) {}
+  }
+  setInterval(pollState, 650);
+  pollState();
+
+  async function sendCmd(text) {
+    if (!text.trim()) return;
+    await fetch("/api/command", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text: text})
+    });
+  }
+
+  function sendFromInput() {
+    const inp = document.getElementById("cmdInput");
+    const val = inp.value.trim();
+    if (!val) return;
+    inp.value = "";
+    sendCmd(val);
+  }
+
+  async function triggerVoiceListen() {
+    await fetch("/api/listen", {method: "POST"});
+  }
+
+  async function stopVoice() {
+    await fetch("/api/stop_voice", {method: "POST"});
+  }
+
+  async function toggleHandsfree() {
+    const res = await fetch("/api/handsfree", {method: "POST"});
+    const data = await res.json();
+    handsfreeActive = data.handsfree;
+    const btn = document.getElementById("btnHandsfree");
+    btn.innerText = handsfreeActive
+      ? "🔄 CONVERSACIÓN CONTINUA: ON"
+      : "🔄 CONVERSACIÓN CONTINUA: OFF";
+    btn.classList.toggle("active", handsfreeActive);
+  }
+
+  async function changeVoice() {
+    const raw = document.getElementById("voiceSelect").value;
+    const [voice, pitch, rate] = raw.split("|");
+    await fetch("/api/voice", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({voice, pitch, rate})
+    });
+  }
+
+  async function addMemoryManual() {
+    const inp = document.getElementById("memInput");
+    if (!inp.value.trim()) return;
+    const note = inp.value.trim();
+    inp.value = "";
+    sendCmd("Recuerda que " + note);
+  }
+
+  async function setupShortcut(startup) {
+    const res = await fetch("/api/shortcut", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({startup: startup})
+    });
+    const data = await res.json();
+    alert(data.message || data.error);
+  }
+</script>
+</body>
+</html>
+"""
+
+
+# ======================================================================
+# FILE: modules\notion_bridge.py
+# ======================================================================
+
+"""
+Ruta: modules/notion_bridge.py
+Descripción: Conector bidireccional para Notion API y generador automático de la Skin Rainmeter.
+"""
+import time
+import logging
+from datetime import datetime
+from typing import Dict, Any, List
+import requests
+from config import Config, SKINS_DIR
+
+logger = logging.getLogger("NotionBridge")
+
+
+class NotionBridge:
+    BASE_URL = "https://api.notion.com/v1"
+    NOTION_VERSION = "2022-06-28"
+
+    def __init__(self) -> None:
+        self.enabled = bool(Config.NOTION_API_KEY and Config.NOTION_DATABASE_ID)
+        self.headers = {
+            "Authorization": f"Bearer {Config.NOTION_API_KEY}",
+            "Notion-Version": self.NOTION_VERSION,
+            "Content-Type": "application/json",
+        }
+        self._cached_tasks: List[Dict[str, str]] = []
+        self._last_fetch_ts: float = 0.0
+        self._session = requests.Session()
+
+    def fetch_tasks(self, limit: int = 5) -> List[Dict[str, str]]:
+        """Obtiene tareas desde Notion si está configurado en .env."""
+        if not self.enabled:
+            return []
+        if time.time() - self._last_fetch_ts < 60:
+            return self._cached_tasks
+
+        url = f"{self.BASE_URL}/databases/{Config.NOTION_DATABASE_ID}/query"
+        try:
+            resp = self._session.post(url, headers=self.headers, json={"page_size": limit}, timeout=8)
+            if resp.status_code != 200:
+                logger.warning(f"Notion API respondió {resp.status_code}: {resp.text[:120]}")
+                return []
+            results = resp.json().get("results", [])
+            tasks: List[Dict[str, str]] = []
+            for idx, page in enumerate(results, start=1):
+                props = page.get("properties", {})
+                title = self._extract_title(props)
+                tasks.append({
+                    "id": f"N{idx}",
+                    "title": f"[Notion] {title}",
+                    "datetime": self._extract_date(props),
+                    "status": "pendiente",
+                })
+            self._cached_tasks = tasks
+            self._last_fetch_ts = time.time()
+            return self._cached_tasks
+        except Exception as exc:
+            logger.error(f"Error consultando Notion: {exc}")
+            return []
+
+    def create_task(self, title: str, iso_date: str = "") -> Dict[str, Any]:
+        """Crea una página/tarea directamente en la base de datos de Notion."""
+        if not self.enabled:
+            return {"ok": False, "error": "Notion no configurado en .env (usando agenda local)."}
+
+        date_val = iso_date or datetime.now().strftime("%Y-%m-%d")
+        url = f"{self.BASE_URL}/pages"
+        payload = {
+            "parent": {"database_id": Config.NOTION_DATABASE_ID},
+            "properties": {
+                "Name": {"title": [{"text": {"content": title.strip()}}]},
+            },
+        }
+        try:
+            resp = self._session.post(url, headers=self.headers, json=payload, timeout=8)
+            if resp.status_code in (200, 201):
+                self._last_fetch_ts = 0.0
+                data = resp.json()
+                logger.info(f"Tarea sincronizada en Notion: {title}")
+                return {"ok": True, "url": data.get("url", ""), "date": date_val}
+            return {"ok": False, "error": f"HTTP {resp.status_code}"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def _extract_title(props: Dict[str, Any]) -> str:
+        for prop in props.values():
+            if prop.get("type") == "title":
+                arr = prop.get("title", [])
+                return "".join(t.get("plain_text", "") for t in arr) or "Sin título"
+        return "Sin título"
+
+    @staticmethod
+    def _extract_date(props: Dict[str, Any]) -> str:
+        for prop in props.values():
+            if prop.get("type") == "date" and prop.get("date"):
+                return prop["date"].get("start", "Hoy")
+        return "Hoy"
+
+    @staticmethod
+    def export_rainmeter_skin() -> str:
+        """Genera el archivo skins/HUD_Agent.ini listo para cargar en Rainmeter."""
+        skin_path = SKINS_DIR / "HUD_Agent.ini"
+        port = Config.HUD_PORT
+        ini_content = f"""[Rainmeter]
+Update=1000
+AccurateText=1
+DynamicWindowSize=1
+BackgroundMode=2
+SolidColor=4,12,24,220
+
+[Variables]
+FontTitle=Orbitron
+FontMono=Consolas
+Cyan=0,240,255,255
+Amber=255,190,11,255
+White=226,249,255,255
+Dim=100,136,164,255
+
+[MeasureTelemetryJSON]
+Measure=WebParser
+URL=http://127.0.0.1:{port}/telemetry
+RegExp=(?siU)"status"\\s*:\\s*"(.*)".*"tool"\\s*:\\s*"(.*)".*"last_action"\\s*:\\s*"(.*)".*"updated_at"\\s*:\\s*"(.*)".*"cpu"\\s*:\\s*([0-9.]+).*"ram"\\s*:\\s*([0-9.]+)
+UpdateRate=1
+
+[MeasureStatus]
+Measure=WebParser
+URL=[MeasureTelemetryJSON]
+StringIndex=1
+Substitute="":"OFFLINE"
+
+[MeasureTool]
+Measure=WebParser
+URL=[MeasureTelemetryJSON]
+StringIndex=2
+Substitute="":"NONE"
+
+[MeasureAction]
+Measure=WebParser
+URL=[MeasureTelemetryJSON]
+StringIndex=3
+Substitute="":"Sistema Argon 4 en espera..."
+
+[MeasureTime]
+Measure=WebParser
+URL=[MeasureTelemetryJSON]
+StringIndex=4
+
+[MeasureCPU]
+Measure=WebParser
+URL=[MeasureTelemetryJSON]
+StringIndex=5
+
+[MeasureRAM]
+Measure=WebParser
+URL=[MeasureTelemetryJSON]
+StringIndex=6
+
+[MeterBorderTop]
+Meter=Shape
+Shape=Rectangle 0,0,430,3,0 | Fill Color #Cyan# | StrokeWidth 0
+
+[MeterHeader]
+Meter=String
+X=16
+Y=12
+FontFace=#FontTitle#
+FontSize=11
+FontColor=#Cyan#
+FontWeight=800
+Text=❖ ARGON 4 // HERMES TELEMETRY HUD
+AntiAlias=1
+
+[MeterStatusBadge]
+Meter=String
+MeasureName=MeasureStatus
+X=414
+Y=12
+StringAlign=Right
+FontFace=#FontMono#
+FontSize=10
+FontColor=#Amber#
+Text=[%1]
+AntiAlias=1
+
+[MeterMetrics]
+Meter=String
+MeasureName=MeasureCPU
+MeasureName2=MeasureRAM
+MeasureName3=MeasureTool
+X=16
+Y=42
+FontFace=#FontMono#
+FontSize=10
+FontColor=#White#
+Text=CPU: %1%   |   RAM: %2%   |   TOOL: %3
+AntiAlias=1
+
+[MeterDivider]
+Meter=Shape
+Shape=Line 16,68,414,68 | StrokeWidth 1 | Stroke Color 0,240,255,70
+
+[MeterLastActionLabel]
+Meter=String
+MeasureName=MeasureTime
+X=16
+Y=76
+FontFace=#FontMono#
+FontSize=8
+FontColor=#Dim#
+Text=ÚLTIMA ACCIÓN (%1):
+AntiAlias=1
+
+[MeterLastActionBody]
+Meter=String
+MeasureName=MeasureAction
+X=16
+Y=94
+W=398
+H=45
+ClipString=2
+FontFace=#FontMono#
+FontSize=9
+FontColor=#White#
+Text=%1
+AntiAlias=1
+"""
+        skin_path.write_text(ini_content, encoding="utf-8")
+        return str(skin_path)
+
+
+# ======================================================================
+# FILE: modules\productivity_tools.py
+# ======================================================================
+
+"""
+Ruta: modules/productivity_tools.py
+Descripción: Gestión de agenda/calendario local, lectura de correos por IMAP
+e inspección inteligente de archivos de código locales.
+"""
+import ast
+import email
+from email.header import decode_header
+import imaplib
+import json
+import logging
+import threading
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List
+from config import Config, BASE_DIR, LOG_DIR
+
+logger = logging.getLogger("ProductivityTools")
+CALENDAR_FILE = LOG_DIR / "calendar_tasks.json"
+
+
+class ProductivityTools:
+    def __init__(self) -> None:
+        self._cal_lock = threading.Lock()
+        self._cached_events: List[Dict[str, Any]] | None = None
+        self._ensure_calendar_file()
+
+    def _ensure_calendar_file(self) -> None:
+        with self._cal_lock:
+            if not CALENDAR_FILE.exists():
+                sample_events = [
+                    {
+                        "id": 1,
+                        "title": "Revisar arquitectura de Argon 4 en VS Code",
+                        "datetime": datetime.now().strftime("%Y-%m-%d 18:30"),
+                        "status": "pendiente"
+                    }
+                ]
+                CALENDAR_FILE.write_text(
+                    json.dumps(sample_events, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+
+    # ---------------- CALENDARIO Y PENDIENTES ----------------
+    def list_calendar_events(self) -> List[Dict[str, Any]]:
+        """Devuelve la lista de eventos y pendientes activos usando caché en memoria."""
+        with self._cal_lock:
+            if self._cached_events is not None:
+                return list(self._cached_events)
+            try:
+                data = json.loads(CALENDAR_FILE.read_text(encoding="utf-8"))
+                self._cached_events = [item for item in data if item.get("status") == "pendiente"]
+                return list(self._cached_events)
+            except Exception as exc:
+                logger.error(f"Error leyendo calendario: {exc}")
+                return []
+
+    def add_calendar_event(self, title: str, date_str: str = "") -> Dict[str, Any]:
+        """Agrega un nuevo pendiente o cita a la agenda local."""
+        with self._cal_lock:
+            try:
+                data = json.loads(CALENDAR_FILE.read_text(encoding="utf-8"))
+                if not date_str:
+                    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                new_item = {
+                    "id": len(data) + 1,
+                    "title": title.strip(),
+                    "datetime": date_str,
+                    "status": "pendiente"
+                }
+                data.append(new_item)
+                CALENDAR_FILE.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                self._cached_events = None
+                logger.info(f"Pendiente agregado al calendario: {title}")
+                return {"ok": True, "event": new_item}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def complete_calendar_event(self, event_id: int) -> Dict[str, Any]:
+        """Marca un pendiente como completado por su ID."""
+        with self._cal_lock:
+            try:
+                data = json.loads(CALENDAR_FILE.read_text(encoding="utf-8"))
+                for item in data:
+                    if item.get("id") == event_id:
+                        item["status"] = "completado"
+                        CALENDAR_FILE.write_text(
+                            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+                        )
+                        self._cached_events = None
+                        return {"ok": True, "title": item.get("title")}
+                return {"ok": False, "error": f"No se encontró el pendiente #{event_id}."}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    # ---------------- REVISIÓN DE CORREOS (IMAP / WEB) ----------------
+    @staticmethod
+    def check_emails(limit: int = 3) -> Dict[str, Any]:
+        """
+        Consulta los últimos correos vía IMAP si las credenciales están en .env.
+        Si no están configuradas, abre la bandeja de entrada en el navegador.
+        """
+        if not Config.EMAIL_USER or not Config.EMAIL_APP_PASSWORD:
+            webbrowser.open("https://mail.google.com")
+            return {
+                "ok": True,
+                "mode": "browser",
+                "summary": (
+                    "He abierto tu bandeja de correo en el navegador. "
+                    "Si deseas que lea tus correos en voz alta sin abrir el navegador, "
+                    "coloca tu EMAIL_USER y EMAIL_APP_PASSWORD en el archivo .env."
+                )
+            }
+
+        try:
+            mail = imaplib.IMAP4_SSL(Config.EMAIL_IMAP_HOST, timeout=10)
+            mail.login(Config.EMAIL_USER, Config.EMAIL_APP_PASSWORD)
+            mail.select("inbox")
+
+            status, messages = mail.search(None, "UNSEEN")
+            mail_ids = messages[0].split()
+            if not mail_ids:
+                mail.logout()
+                return {"ok": True, "mode": "imap", "summary": "No tienes correos nuevos sin leer."}
+
+            recent_ids = mail_ids[-limit:]
+            summaries = []
+            for m_id in reversed(recent_ids):
+                _, msg_data = mail.fetch(m_id, "(RFC822)")
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
+                        subject, encoding = decode_header(msg.get("Subject", "Sin asunto"))[0]
+                        if isinstance(subject, bytes):
+                            subject = subject.decode(encoding or "utf-8", errors="ignore")
+                        sender = msg.get("From", "Remitente desconocido")
+                        summaries.append(f"De {sender}: {subject}")
+
+            mail.logout()
+            joined = " | ".join(summaries)
+            return {
+                "ok": True,
+                "mode": "imap",
+                "summary": f"Tienes {len(mail_ids)} correos sin leer. Los más recientes son: {joined}"
+            }
+        except Exception as exc:
+            logger.error(f"Error IMAP: {exc}")
+            return {"ok": False, "error": f"No pude conectar al servidor de correo: {exc}"}
+
+    # ---------------- AUDITOR Y ANALIZADOR DE CÓDIGO ----------------
+    @staticmethod
+    def analyze_code_file(relative_path: str) -> Dict[str, Any]:
+        """
+        Inspecciona un archivo de código del proyecto, verifica su sintaxis AST
+        y extrae su contenido bloqueando el acceso a archivos sensibles (.env).
+        """
+        clean_name = relative_path.strip().replace('"', "").replace("'", "")
+        if ".env" in clean_name.lower():
+            return {"ok": False, "error": "Acceso denegado: Por seguridad no se permite inspeccionar archivos .env."}
+
+        base_resolved = BASE_DIR.resolve()
+        target = (BASE_DIR / clean_name).resolve()
+
+        if not str(target).startswith(str(base_resolved)) or not target.exists() or not target.is_file():
+            matches = [
+                m for m in BASE_DIR.rglob(f"*{Path(clean_name).name}*")
+                if ".venv" not in str(m) and ".env" not in m.name.lower() and m.is_file()
+            ]
+            if matches:
+                target = matches[0].resolve()
+            else:
+                return {"ok": False, "error": f"No encontré el archivo '{clean_name}' en el proyecto."}
+
+        try:
+            content = target.read_text(encoding="utf-8", errors="ignore")
+            lines = content.splitlines()
+            syntax_status = "Sintaxis válida"
+
+            if target.suffix == ".py":
+                try:
+                    tree = ast.parse(content)
+                    funcs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+                    classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+                    syntax_status = (
+                        f"Sintaxis Python correcta. Contiene {len(classes)} clases "
+                        f"({', '.join(classes[:4])}) y {len(funcs)} funciones."
+                    )
+                except SyntaxError as syn_err:
+                    syntax_status = f"Error de sintaxis en línea {syn_err.lineno}: {syn_err.msg}"
+
+            return {
+                "ok": True,
+                "filepath": str(target.relative_to(base_resolved)),
+                "lines": len(lines),
+                "syntax": syntax_status,
+                "snippet": "\n".join(lines[:90])
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+
+# ======================================================================
+# FILE: modules\system_tasks.py
+# ======================================================================
+
+"""
+Ruta: modules/system_tasks.py
+Descripción: Ejecución de tareas del sistema operativo, telemetría y protocolos externos.
+"""
+import logging
+import platform
+import subprocess
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+import psutil
+import pyautogui
+from config import BASE_DIR
+
+logger = logging.getLogger("SystemTasks")
+
+# Prevención de bloqueos de PyAutoGUI al llevar el cursor a una esquina
+pyautogui.FAILSAFE = True
+
+# Inicializar lectura base de CPU para que las llamadas posteriores con interval=None sean instantáneas (0ms)
+psutil.cpu_percent(interval=None)
+
+
+class SystemTasks:
+    @staticmethod
+    def get_system_status() -> Dict[str, Any]:
+        """Obtiene métricas reales de CPU, RAM, disco y batería sin bloquear el hilo."""
+        try:
+            cpu_usage = psutil.cpu_percent(interval=None)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage(str(BASE_DIR))
+            battery = psutil.sensors_battery()
+
+            status = {
+                "cpu_percent": cpu_usage,
+                "ram_percent": memory.percent,
+                "ram_available_gb": round(memory.available / (1024 ** 3), 2),
+                "disk_free_gb": round(disk.free / (1024 ** 3), 2),
+                "battery_percent": int(battery.percent) if battery else 100,
+                "power_plugged": battery.power_plugged if battery else True,
+            }
+            logger.debug(f"Telemetría recolectada: {status}")
+            return {"ok": True, "data": status}
+        except Exception as exc:
+            logger.error(f"Error al leer telemetría del sistema: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def take_screenshot() -> Dict[str, Any]:
+        """Guarda una captura de pantalla en la carpeta local logs/."""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = BASE_DIR / "logs" / f"screenshot_{timestamp}.png"
+            image = pyautogui.screenshot()
+            image.save(filepath)
+            logger.info(f"Captura de pantalla almacenada en: {filepath}")
+            return {"ok": True, "filepath": str(filepath)}
+        except Exception as exc:
+            logger.error(f"Fallo al capturar pantalla: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def open_application(app_name: str) -> Dict[str, Any]:
+        """Abre aplicaciones estándar del sistema según la plataforma actual."""
+        system_os = platform.system().lower()
+        app_key = app_name.lower().strip()
+
+        # Mapa seguro de binarios comunes
+        app_map = {
+            "windows": {
+                "calculadora": ["calc.exe"],
+                "bloc de notas": ["notepad.exe"],
+                "explorador": ["explorer.exe"],
+                "terminal": ["cmd.exe", "/c", "start", "cmd.exe"],
+            },
+            "linux": {
+                "calculadora": ["gnome-calculator"],
+                "bloc de notas": ["gedit"],
+                "explorador": ["xdg-open", str(Path.home())],
+                "terminal": ["x-terminal-emulator"],
+            },
+            "darwin": {
+                "calculadora": ["open", "-a", "Calculator"],
+                "bloc de notas": ["open", "-a", "TextEdit"],
+                "explorador": ["open", str(Path.home())],
+                "terminal": ["open", "-a", "Terminal"],
+            },
+        }
+
+        commands = app_map.get(system_os, {}).get(app_key)
+        if not commands:
+            return {
+                "ok": False,
+                "error": f"Aplicación '{app_name}' no registrada en la lista blanca para {system_os}."
+            }
+
+        try:
+            subprocess.Popen(
+                commands,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=(system_os == "windows" and app_key == "terminal")
+            )
+            logger.info(f"Aplicación ejecutada: {app_name}")
+            return {"ok": True, "app": app_name}
+        except FileNotFoundError:
+            return {"ok": False, "error": f"No se encontró el binario para '{app_name}'."}
+        except Exception as exc:
+            logger.error(f"Error lanzando aplicación {app_name}: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def open_external_protocol(uri: str) -> Dict[str, Any]:
+        """
+        Dispara enlaces de protocolo local (ej. sip:usuario@dominio, whatsapp://send?phone=...).
+        """
+        try:
+            webbrowser.open(uri)
+            logger.info(f"Enlace de protocolo externo invocado: {uri}")
+            return {"ok": True, "uri": uri}
+        except Exception as exc:
+            logger.error(f"Error al abrir URI {uri}: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+
+# ======================================================================
+# FILE: modules\tool_router.py
+# ======================================================================
+
+"""
+Ruta: modules/tool_router.py
+Descripción: Motor SOTA de Tool Calling Nativo y Ejecución Paralela (ThreadPoolExecutor)
+conectado a Google Gemini API (principal) y Ollama (respaldo local).
+"""
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List
+from config import Config
+
+logger = logging.getLogger("ToolRouter")
+
+
+class AgentToolRouter:
+    def __init__(self, orchestrator: Any) -> None:
+        self.core = orchestrator
+        self.executor = ThreadPoolExecutor(max_workers=4)
+
+        self.registry: Dict[str, Callable[..., Dict[str, Any]]] = {
+            "save_memory": self._tool_save_memory,
+            "recall_memories": self._tool_recall_memories,
+            "search_web": self._tool_search_web,
+            "read_clipboard": self._tool_read_clipboard,
+            "get_system_status": self._tool_system_status,
+            "get_top_processes": self._tool_top_processes,
+            "add_task": self._tool_add_task,
+            "list_tasks": self._tool_list_tasks,
+            "check_emails": self._tool_check_emails,
+            "send_whatsapp": self._tool_send_whatsapp,
+            "open_application": self._tool_open_application,
+        }
+
+        # Declaraciones de funciones compatibles con Google Gemini y Ollama
+        self.function_declarations: List[Dict[str, Any]] = [
+            {
+                "name": "save_memory",
+                "description": "Guarda un dato, preferencia o hecho importante en la memoria permanente SQLite.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "note": {"type": "STRING", "description": "El hecho o nota a recordar."},
+                        "category": {"type": "STRING", "description": "Categoría (Clave, Proyecto, Preferencia)."}
+                    },
+                    "required": ["note"]
+                }
+            },
+            {
+                "name": "search_web",
+                "description": "Busca información o noticias en tiempo real en internet.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "query": {"type": "STRING", "description": "Término de búsqueda web."}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "read_clipboard",
+                "description": "Lee el texto actual copiado en el portapapeles de Windows.",
+                "parameters": {"type": "OBJECT", "properties": {}}
+            },
+            {
+                "name": "get_system_status",
+                "description": "Obtiene el uso actual de CPU, RAM, disco y batería del sistema.",
+                "parameters": {"type": "OBJECT", "properties": {}}
+            },
+            {
+                "name": "get_top_processes",
+                "description": "Lista los procesos que más memoria RAM están consumiendo.",
+                "parameters": {"type": "OBJECT", "properties": {}}
+            },
+            {
+                "name": "add_task",
+                "description": "Agenda una tarea o pendiente en el calendario local y en Notion API.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "title": {"type": "STRING", "description": "Título de la tarea o evento a agendar."}
+                    },
+                    "required": ["title"]
+                }
+            },
+            {
+                "name": "list_tasks",
+                "description": "Lista las tareas y pendientes activos de la agenda local y Notion.",
+                "parameters": {"type": "OBJECT", "properties": {}}
+            },
+            {
+                "name": "check_emails",
+                "description": "Revisa los correos electrónicos no leídos en la bandeja IMAP.",
+                "parameters": {"type": "OBJECT", "properties": {}}
+            },
+            {
+                "name": "send_whatsapp",
+                "description": "Envía un mensaje de WhatsApp a un número o al teléfono por defecto.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "message": {"type": "STRING", "description": "Texto del mensaje a enviar."},
+                        "phone": {"type": "STRING", "description": "Número destino opcional (ej. +51999888777)."}
+                    },
+                    "required": ["message"]
+                }
+            },
+            {
+                "name": "open_application",
+                "description": "Abre una aplicación de Windows (calculadora, bloc de notas, explorador, terminal).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "app_name": {
+                            "type": "STRING",
+                            "description": "Nombre de la aplicación: calculadora, bloc de notas, explorador o terminal."
+                        }
+                    },
+                    "required": ["app_name"]
+                }
+            },
+        ]
+
+        # Adaptación en minúsculas para Ollama
+        self.ollama_tools: List[Dict[str, Any]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": d["name"],
+                    "description": d["description"],
+                    "parameters": json.loads(json.dumps(d["parameters"]).replace('"OBJECT"', '"object"').replace('"STRING"', '"string"'))
+                }
+            }
+            for d in self.function_declarations
+        ]
+
+    # ---------------- WRAPPERS DE HERRAMIENTAS ----------------
+    def _tool_save_memory(self, note: str, category: str = "Clave") -> Dict[str, Any]:
+        return self.core.skills.save_memory(note, category=category)
+
+    def _tool_recall_memories(self) -> Dict[str, Any]:
+        return {"ok": True, "memories": self.core.skills.recall_memories(limit=8)}
+
+    def _tool_search_web(self, query: str) -> Dict[str, Any]:
+        return self.core.skills.search_web(query)
+
+    def _tool_read_clipboard(self) -> Dict[str, Any]:
+        return self.core.skills.read_clipboard()
+
+    def _tool_system_status(self) -> Dict[str, Any]:
+        return self.core.tasks.get_system_status()
+
+    def _tool_top_processes(self) -> Dict[str, Any]:
+        return self.core.skills.get_top_processes()
+
+    def _tool_add_task(self, title: str) -> Dict[str, Any]:
+        local_res = self.core.productivity.add_calendar_event(title)
+        notion_res = self.core.notion.create_task(title)
+        return {"ok": True, "local": local_res, "notion_synced": notion_res.get("ok", False), "title": title}
+
+    def _tool_list_tasks(self) -> Dict[str, Any]:
+        return {"ok": True, "events": self.core.get_unified_calendar()[:6]}
+
+    def _tool_check_emails(self) -> Dict[str, Any]:
+        return self.core.productivity.check_emails()
+
+    def _tool_send_whatsapp(self, message: str, phone: str = "") -> Dict[str, Any]:
+        target = phone.strip() if phone else Config.DEFAULT_TARGET_PHONE
+        return self.core.whatsapp.send_message(target, message)
+
+    def _tool_open_application(self, app_name: str) -> Dict[str, Any]:
+        return self.core.tasks.open_application(app_name)
+
+    # ---------------- DESPACHO PARALELO ----------------
+    def execute_parallel_calls(self, normalized_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Ejecuta múltiples herramientas simultáneamente en hilos paralelos."""
+        results: List[Dict[str, Any]] = []
+        futures = {}
+
+        for call in normalized_calls:
+            fn_name = call.get("name", "")
+            args = call.get("args", {}) or {}
+
+            fn = self.registry.get(fn_name)
+            if not fn:
+                results.append({"tool": fn_name, "result": {"ok": False, "error": "Herramienta no registrada."}})
+                continue
+
+            self.core._set_tool_telemetry(fn_name.upper(), f"Ejecutando {fn_name}...")
+            future = self.executor.submit(fn, **args)
+            futures[future] = fn_name
+
+        for future in as_completed(futures):
+            fn_name = futures[future]
+            try:
+                res = future.result(timeout=35)
+                results.append({"tool": fn_name, "result": res})
+            except Exception as exc:
+                logger.error(f"Error en herramienta {fn_name}: {exc}")
+                results.append({"tool": fn_name, "result": {"ok": False, "error": str(exc)}})
+
+        return results
+
+    def route_and_execute(self, user_text: str) -> str | None:
+        """
+        1. Si GEMINI_API_KEY está activa, usa Function Calling nativo de Google Gemini.
+        2. Si no, usa Function Calling de Ollama local.
+        """
+        # 1. Google Gemini Native Tool Calling
+        if self.core.gemini_online:
+            try:
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{Config.GEMINI_MODEL}:generateContent?key={Config.GEMINI_API_KEY}"
+                )
+                payload = {
+                    "systemInstruction": {"parts": [{"text": self.core.system_prompt}]},
+                    "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+                    "tools": [{"functionDeclarations": self.function_declarations}],
+                }
+                resp = self.core.http.post(url, json=payload, timeout=20)
+                if resp.status_code == 200:
+                    candidates = resp.json().get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        gemini_calls = [
+                            {"name": p["functionCall"]["name"], "args": p["functionCall"].get("args", {})}
+                            for p in parts if "functionCall" in p
+                        ]
+                        if gemini_calls:
+                            tool_outputs = self.execute_parallel_calls(gemini_calls)
+                            context_str = json.dumps(tool_outputs, ensure_ascii=False)
+                            return self.core.ask_brain(
+                                f"Confirma al usuario de forma ejecutiva el resultado de su solicitud: '{user_text}'",
+                                extra_context=f"[RESULTADOS DE HERRAMIENTAS EJECUTADAS]: {context_str}"
+                            )
+            except Exception as exc:
+                logger.debug(f"Gemini Tool Router fallback: {exc}")
+
+        # 2. Ollama Local Tool Calling
+        if not self.core.ollama_online:
+            return None
+
+        try:
+            payload = {
+                "model": self.core.active_model,
+                "messages": [
+                    {"role": "system", "content": self.core.system_prompt},
+                    {"role": "user", "content": user_text}
+                ],
+                "tools": self.ollama_tools,
+                "stream": False
+            }
+            resp = self.core.http.post(
+                f"{Config.OLLAMA_HOST}/api/chat",
+                json=payload,
+                timeout=Config.OLLAMA_TIMEOUT
+            )
+            if resp.status_code != 200:
+                return None
+
+            raw_calls = resp.json().get("message", {}).get("tool_calls", [])
+            if not raw_calls:
+                return None
+
+            ollama_calls = []
+            for c in raw_calls:
+                fn_info = c.get("function", {})
+                raw_args = fn_info.get("arguments", {})
+                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                ollama_calls.append({"name": fn_info.get("name", ""), "args": args})
+
+            tool_outputs = self.execute_parallel_calls(ollama_calls)
+            context_str = json.dumps(tool_outputs, ensure_ascii=False)
+            return self.core.ask_brain(
+                f"Confirma al usuario de forma ejecutiva el resultado de su solicitud: '{user_text}'",
+                extra_context=f"[RESULTADOS DE HERRAMIENTAS EJECUTADAS]: {context_str}"
+            )
+        except Exception as exc:
+            logger.debug(f"Ollama Tool Router fallback: {exc}")
+            return None
+
+
+# ======================================================================
+# FILE: modules\voice_engine.py
+# ======================================================================
+
+"""
+Ruta: modules/voice_engine.py
+Descripción: Motor de voz neuronal con modulación de tono grave futurista (Pitch/Rate DSP),
+soporte de interrupción instantánea (Barge-In) y sincronización con el HUD Holográfico.
+"""
+import asyncio
+import logging
+import os
+import tempfile
+import threading
+from typing import Optional, Callable
+import speech_recognition as sr
+import pyttsx3
+import edge_tts
+import pygame
+from config import Config
+
+logger = logging.getLogger("VoiceEngine")
+
+
+class VoiceEngine:
+    def __init__(self, on_state_change: Optional[Callable[[str], None]] = None) -> None:
+        self.on_state_change = on_state_change
+        self.recognizer = sr.Recognizer()
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 0.85
+        self.mic_available = False
+        self.tts_available = False
+        self._speak_lock = threading.Lock()
+        self._listen_lock = threading.Lock()
+        self._abort_speech = threading.Event()
+
+        # Configuración de timbre grave futurista (estilo J.A.R.V.I.S.)
+        self.voice_name: str = getattr(Config, "ASSISTANT_VOICE", "es-ES-AlvaroNeural")
+        if self.voice_name == "es-PE-AlexNeural":
+            self.voice_name = "es-ES-AlvaroNeural"
+        self.voice_pitch: str = getattr(Config, "VOICE_PITCH", "-14Hz")
+        self.voice_rate: str = getattr(Config, "VOICE_RATE_STR", "+6%")
+
+        try:
+            pygame.mixer.init(frequency=24000, size=-16, channels=2, buffer=1024)
+            self.neural_audio_ready = True
+        except Exception as exc:
+            logger.warning(f"No se pudo iniciar pygame.mixer ({exc}).")
+            self.neural_audio_ready = False
+
+        self._init_fallback_tts()
+        self._check_microphone()
+
+    def set_voice_profile(self, voice_name: str, pitch: str = "-14Hz", rate: str = "+6%") -> None:
+        """Permite ajustar la profundidad de la voz en caliente desde el HUD."""
+        self.voice_name = voice_name
+        self.voice_pitch = pitch
+        self.voice_rate = rate
+        logger.info(f"Perfil de voz actualizado: {voice_name} | Pitch: {pitch} | Rate: {rate}")
+
+    def stop_speaking(self) -> None:
+        """Interrupción instantánea (Barge-In): corta cualquier locución activa en <10ms."""
+        self._abort_speech.set()
+        if self.neural_audio_ready:
+            try:
+                if pygame.mixer.music.get_busy():
+                    pygame.mixer.music.stop()
+            except Exception:
+                pass
+        if self.tts_available:
+            try:
+                self.engine.stop()
+            except Exception:
+                pass
+        self._notify_state("IDLE")
+
+    def _notify_state(self, state: str) -> None:
+        if self.on_state_change:
+            try:
+                self.on_state_change(state)
+            except Exception:
+                pass
+
+    def _init_fallback_tts(self) -> None:
+        try:
+            self.engine = pyttsx3.init()
+            self.engine.setProperty("rate", 165)
+            self.engine.setProperty("volume", 1.0)
+            self.tts_available = True
+        except Exception:
+            self.tts_available = False
+
+    def _check_microphone(self) -> None:
+        try:
+            mics = sr.Microphone.list_microphone_names()
+            self.mic_available = bool(mics)
+        except Exception:
+            self.mic_available = False
+
+    async def _synthesize_edge_tts(self, text: str, output_path: str) -> None:
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=self.voice_name,
+            pitch=self.voice_pitch,
+            rate=self.voice_rate
+        )
+        await communicate.save(output_path)
+
+    def speak(self, text: str) -> None:
+        """Sintetiza voz neuronal con frecuencia grave (-14Hz) e interrupción Barge-In."""
+        if not text:
+            return
+        clean_text = text.replace("*", "").replace("#", "").strip()
+        if not clean_text:
+            return
+
+        # Si ya estaba hablando, interrumpir la locución anterior para priorizar la nueva
+        self.stop_speaking()
+
+        with self._speak_lock:
+            self._abort_speech.clear()
+            print(f"\n[{Config.AGENT_NAME}]: {clean_text}")
+            self._notify_state("SPEAKING")
+
+            if self.neural_audio_ready:
+                temp_file = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+                        temp_file = fp.name
+
+                    asyncio.run(self._synthesize_edge_tts(clean_text, temp_file))
+
+                    if self._abort_speech.is_set():
+                        if temp_file and os.path.exists(temp_file):
+                            os.remove(temp_file)
+                        self._notify_state("IDLE")
+                        return
+
+                    pygame.mixer.music.load(temp_file)
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy():
+                        if self._abort_speech.is_set():
+                            pygame.mixer.music.stop()
+                            break
+                        pygame.time.Clock().tick(30)
+                    pygame.mixer.music.unload()
+                    if temp_file and os.path.exists(temp_file):
+                        os.remove(temp_file)
+                    self._notify_state("IDLE")
+                    return
+                except Exception as exc:
+                    logger.warning(f"Fallo en síntesis neuronal ({exc}). Usando respaldo.")
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except OSError:
+                            pass
+
+            if self.tts_available and not self._abort_speech.is_set():
+                try:
+                    self.engine.say(clean_text)
+                    self.engine.runAndWait()
+                except Exception as exc:
+                    logger.error(f"Error TTS offline: {exc}")
+
+            self._notify_state("IDLE")
+
+    def listen(self, timeout: int = 6, phrase_time_limit: int = 15) -> Optional[str]:
+        if not self.mic_available:
+            return None
+        # Cortar la voz del agente inmediatamente al iniciar la escucha (Barge-In)
+        self.stop_speaking()
+
+        if not self._listen_lock.acquire(blocking=False):
+            return None
+        try:
+            self._notify_state("LISTENING")
+            with sr.Microphone() as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                audio = self.recognizer.listen(
+                    source, timeout=timeout, phrase_time_limit=phrase_time_limit
+                )
+            self._notify_state("THINKING")
+            query = self.recognizer.recognize_google(audio, language=Config.LANGUAGE_CODE)
+            logger.info(f"Voz reconocida: '{query}'")
+            self._notify_state("IDLE")
+            return query.strip()
+        except (sr.WaitTimeoutError, sr.UnknownValueError):
+            self._notify_state("IDLE")
+            return None
+        except Exception as exc:
+            logger.error(f"Error en captura de voz: {exc}")
+            self._notify_state("IDLE")
+            return None
+        finally:
+            self._listen_lock.release()
+
+
+# ======================================================================
+# FILE: modules\voip_caller.py
+# ======================================================================
+
+"""
+Ruta: modules/voip_caller.py
+Descripción: Enrutador de llamadas VoIP/SIP y WebRTC de costo cero mediante Linphone CLI,
+protocolos nativos del sistema operativo (sip:/tel:) y salas WebRTC abiertas.
+"""
+import re
+import uuid
+import shutil
+import subprocess
+import webbrowser
+import logging
+from typing import Dict, Any, Optional
+from config import Config
+
+logger = logging.getLogger("VoIPCaller")
+
+
+class VoIPCaller:
+    def __init__(self) -> None:
+        self.softphone_bin = Config.SIP_SOFTPHONE_BIN
+        self.cli_available = shutil.which(self.softphone_bin) is not None
+        if self.cli_available:
+            logger.info(f"Binario VoIP CLI detectado: {self.softphone_bin}")
+        else:
+            logger.info(
+                "Linphone CLI no detectado en PATH. Se usará despacho por protocolo SIP/TEL nativo y WebRTC."
+            )
+
+    @staticmethod
+    def format_target(raw_target: str) -> Optional[str]:
+        """
+        Determina si el destino es una dirección SIP (usuario@dominio) o un número telefónico.
+        """
+        cleaned = raw_target.strip().replace(" ", "")
+        if not cleaned:
+            return None
+
+        # Si es una cuenta SIP (ej. usuario@sip.linphone.org)
+        if "@" in cleaned:
+            return cleaned if cleaned.startswith("sip:") else f"sip:{cleaned}"
+
+        # Si es un número telefónico
+        digits = re.sub(r"[^\d+]", "", cleaned)
+        if len(digits) >= 6:
+            if not digits.startswith("+") and len(digits) == 9:
+                digits = f"{Config.DEFAULT_COUNTRY_CODE}{digits}"
+            return digits
+
+        return None
+
+    def start_call(self, target: str, mode: str = "auto") -> Dict[str, Any]:
+        """
+        Inicia una llamada gratuita usando:
+        - 'cli': Linphone CLI local (si está disponible)
+        - 'protocol': URI sip: o tel: (abre softphone de escritorio o Enlace Móvil de Windows)
+        - 'webrtc': Crea una sala de voz WebRTC instantánea sin registro
+        """
+        if mode == "webrtc":
+            return self.start_webrtc_room()
+
+        formatted = self.format_target(target)
+        if not formatted:
+            return {
+                "ok": False,
+                "error": f"Destino de llamada inválido ('{target}'). Indica un número o cuenta SIP."
+            }
+
+        # 1. Intentar por Linphone CLI si está instalado en el sistema
+        if self.cli_available and mode in ("auto", "cli"):
+            try:
+                subprocess.run(
+                    [self.softphone_bin, "init"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3
+                )
+                res = subprocess.run(
+                    [self.softphone_bin, "generic", f"call {formatted}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if res.returncode == 0:
+                    logger.info(f"Llamada SIP originada por CLI hacia {formatted}")
+                    return {"ok": True, "method": "Linphone CLI", "target": formatted}
+            except Exception as exc:
+                logger.warning(f"Fallo en llamada CLI ({exc}). Conmutando a protocolo nativo...")
+
+        # 2. Enrutamiento por protocolo nativo del SO (sip: o tel:)
+        try:
+            uri = formatted if formatted.startswith("sip:") else f"tel:{formatted}"
+            webbrowser.open(uri)
+            logger.info(f"Protocolo de llamada invocado: {uri}")
+            return {"ok": True, "method": "Protocolo Nativo (SIP/TEL)", "target": uri}
+        except Exception as exc:
+            logger.error(f"Error al disparar protocolo de llamada: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    def hangup_call(self) -> Dict[str, Any]:
+        """Corta una llamada activa en Linphone CLI."""
+        if not self.cli_available:
+            return {
+                "ok": False,
+                "error": "El corte por comando requiere Linphone CLI activo; cierra desde la ventana del softphone."
+            }
+        try:
+            subprocess.run(
+                [self.softphone_bin, "generic", "terminate"],
+                capture_output=True,
+                text=True,
+                timeout=4
+            )
+            logger.info("Llamada finalizada por comando CLI.")
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def start_webrtc_room() -> Dict[str, Any]:
+        """
+        Genera y abre un canal de llamada de voz/video WebRTC gratuito sin cuenta ni tarjeta.
+        """
+        try:
+            room_id = f"Argon4-Voice-{uuid.uuid4().hex[:8]}"
+            room_url = f"https://meet.jit.si/{room_id}#config.startWithVideoMuted=true"
+            webbrowser.open(room_url)
+            logger.info(f"Sala de voz WebRTC abierta: {room_url}")
+            return {"ok": True, "method": "WebRTC Directo", "url": room_url}
+        except Exception as exc:
+            logger.error(f"Error al crear sala WebRTC: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+
+# ======================================================================
+# FILE: modules\whatsapp_bridge.py
+# ======================================================================
+
+"""
+Ruta: modules/whatsapp_bridge.py
+Descripción: Automatización local de WhatsApp Web sin APIs de pago, con normalización
+de números internacionales y respaldo por protocolo URI.
+"""
+import os
+import re
+import time
+import urllib.parse
+import webbrowser
+import logging
+from typing import Dict, Any, Optional
+import pyautogui
+import pywhatkit
+import requests
+from config import Config
+
+logger = logging.getLogger("WhatsAppBridge")
+
+
+class WhatsAppBridge:
+    def __init__(self) -> None:
+        # Agenda rápida local: puedes agregar aquí tus contactos frecuentes
+        self.contacts: Dict[str, str] = {
+            "prueba": os.getenv("TEST_PHONE", ""),
+        }
+
+    @staticmethod
+    def normalize_phone(raw_input: str) -> Optional[str]:
+        """
+        Limpia el texto dictado o escrito y lo convierte a formato E.164 (ej. +51999888777).
+        """
+        digits = re.sub(r"[^\d+]", "", raw_input.strip())
+        if not digits:
+            return None
+
+        if digits.startswith("+"):
+            return digits if len(digits) >= 10 else None
+
+        # Si ya incluye el código de país sin el '+' (ej. 51999888777)
+        clean_cc = Config.DEFAULT_COUNTRY_CODE.replace("+", "")
+        if digits.startswith(clean_cc) and len(digits) >= 11:
+            return f"+{digits}"
+
+        # Número celular local (ej. 9 dígitos en Perú)
+        if len(digits) >= 9:
+            return f"{Config.DEFAULT_COUNTRY_CODE}{digits}"
+
+        return None
+
+    def send_message(self, target_phone: str, message: str, wait_time: int = 15) -> Dict[str, Any]:
+        """
+        Envía un mensaje de WhatsApp intentando primero el puente REST local (Baileys)
+        y conmutando a automatización web (pywhatkit / PyAutoGUI) si no está activo.
+        """
+        phone = self.normalize_phone(target_phone)
+        if not phone:
+            return {
+                "ok": False,
+                "error": f"Número inválido ('{target_phone}'). Dicta o escribe al menos 9 dígitos."
+            }
+
+        if not message or not message.strip():
+            return {"ok": False, "error": "El mensaje está vacío."}
+
+        logger.info(f"Iniciando envío de WhatsApp a {phone}...")
+
+        # 1. Intento vía puente REST local (Baileys)
+        try:
+            bridge_url = f"{Config.WHATSAPP_BRIDGE_URL}/send"
+            payload = {
+                "session": Config.WHATSAPP_SESSION,
+                "phone": phone,
+                "message": message.strip()
+            }
+            resp = requests.post(bridge_url, json=payload, timeout=4)
+            if resp.status_code == 200:
+                logger.info(f"WhatsApp enviado con éxito vía puente REST local a {phone}.")
+                return {"ok": True, "phone": phone, "message": message.strip()}
+            logger.warning(f"Puente REST respondió con código {resp.status_code}. Continuando con navegador...")
+        except requests.RequestException as exc:
+            logger.info(f"Puente REST local de Baileys no disponible ({exc}). Continuando con flujo de navegador...")
+
+        # 2. Flujo de navegador (pywhatkit + respaldo por URL)
+        try:
+            # Método principal: abre WhatsApp Web, espera carga, escribe, envía y cierra pestaña
+            pywhatkit.sendwhatmsg_instantly(
+                phone_no=phone,
+                message=message.strip(),
+                wait_time=wait_time,
+                tab_close=True,
+                close_time=3
+            )
+            logger.info(f"WhatsApp enviado con éxito a {phone}.")
+            return {"ok": True, "phone": phone, "message": message.strip()}
+
+        except Exception as exc:
+            logger.warning(f"Fallo en pywhatkit ({exc}). Intentando respaldo por URL directa...")
+            return self._fallback_web_send(phone, message.strip(), wait_time)
+
+    @staticmethod
+    def _fallback_web_send(phone: str, message: str, wait_time: int) -> Dict[str, Any]:
+        """Respaldo directo abriendo la URL de WhatsApp Web y presionando Enter con PyAutoGUI."""
+        try:
+            encoded_msg = urllib.parse.quote(message)
+            url = f"https://web.whatsapp.com/send?phone={phone.replace('+', '')}&text={encoded_msg}"
+            webbrowser.open(url)
+            time.sleep(wait_time)
+            pyautogui.press("enter")
+            logger.info(f"WhatsApp enviado por vía de respaldo a {phone}.")
+            return {"ok": True, "phone": phone, "message": message}
+        except Exception as exc:
+            logger.error(f"Error crítico enviando WhatsApp: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+
